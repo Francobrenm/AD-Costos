@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Consolidado de Presupuestos</title>
+
+<!-- Tailwind (utilidades CSS) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<!-- Supabase (base de datos + autenticación) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<!-- Chart.js (gráficos) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+  body { font-family: 'Inter', sans-serif; background: #fafaf9; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  .display { font-family: 'Fraunces', serif; }
+</style>
+</head>
+<body class="min-h-screen text-slate-800">
+
+<div id="app">
+  <div class="flex h-screen items-center justify-center text-slate-400">Cargando consolidado...</div>
+</div>
+
+<script>
+/* ============================================================ */
+/*  CONFIGURACIÓN DE SUPABASE                                    */
+/* ============================================================ */
+const SUPABASE_URL = "https://kbvnpowjsegkqjjbqgqh.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtidm5wb3dqc2Vna3FqamJxZ3FoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0Mjc0NjIsImV4cCI6MjA5OTAwMzQ2Mn0.eCDCDrrALL-nppuIQjUwoN32nUVLt2JOcDX2BUYcaTI";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ============================================================ */
+/*  CONSTANTES Y CÁLCULOS (idénticos a la versión de Claude)     */
+/* ============================================================ */
+const PRORRATEO = { cerrada: 1, ducto: 1, cochera: 0.5, pilas: 0.5, azotea: 0.35 };
+
+const FIELD_LABELS = {
+  cerrada: "Área Cerrada (m²)", ducto: "Área Ducto (m²)", cochera: "Cochera (m²)",
+  pilas: "Pilas / Terraza (m²)", azotea: "Azotea (m²)", lote: "Área Lote (m²)",
+  costoDirecto: "Costo Directo (₡)", costoIndirecto: "Costo Indirecto (₡)",
+  postventa: "Postventa (₡)", precioVenta: "Precio Venta (₡)", precioLote: "Precio Lote (₡)",
+};
+const AREA_FIELDS = ["cerrada", "ducto", "cochera", "pilas", "azotea", "lote"];
+const MONEY_FIELDS = ["costoDirecto", "costoIndirecto", "postventa", "precioVenta", "precioLote"];
+const emptyForm = Object.fromEntries(["casa", "modelo", ...AREA_FIELDS, ...MONEY_FIELDS].map(k => [k, ""]));
+
+function calcDerived(h) {
+  const areaTotal = h.cerrada + h.ducto + h.cochera + h.pilas + h.azotea;
+  const areaProrrateada = h.cerrada * PRORRATEO.cerrada + h.ducto * PRORRATEO.ducto +
+    h.cochera * PRORRATEO.cochera + h.pilas * PRORRATEO.pilas + h.azotea * PRORRATEO.azotea;
+  const ratioIndirecto = (h.precioVenta - h.precioLote) > 0 ? h.costoIndirecto / (h.precioVenta - h.precioLote) : 0;
+  const costoDirectoM2 = areaTotal > 0 ? h.costoDirecto / areaTotal : 0;
+  const costoTotal = h.costoDirecto + h.costoIndirecto + h.postventa + h.precioLote;
+  const utilidad = h.precioVenta - costoTotal;
+  const margenPct = h.precioVenta > 0 ? (utilidad / h.precioVenta) * 100 : 0;
+  return { areaTotal, areaProrrateada, ratioIndirecto, costoDirectoM2, costoTotal, utilidad, margenPct };
+}
+
+const fmtMoney = (v) => new Intl.NumberFormat("es-CR", { maximumFractionDigits: 0 }).format(v || 0);
+const fmtNum = (v, d = 2) => new Intl.NumberFormat("es-CR", { minimumFractionDigits: d, maximumFractionDigits: d }).format(v || 0);
+const fmtPct = (v, d = 1) => `${fmtNum(v, d)}%`;
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+// Evalúa de forma segura expresiones como "2+3.5" o "(10*2)+1.25" escritas en los campos.
+// Solo permite dígitos, + - * / ( ) y puntos decimales; cualquier otro caracter invalida el cálculo.
+function safeEvalMath(expr) {
+  if (typeof expr !== "string") return NaN;
+  const trimmed = expr.trim();
+  if (trimmed === "") return NaN;
+  if (!/^[0-9+\-*/().\s]+$/.test(trimmed)) return NaN;
+  try {
+    const result = Function('"use strict"; return (' + trimmed + ")")();
+    return typeof result === "number" && isFinite(result) ? result : NaN;
+  } catch (e) {
+    return NaN;
+  }
+}
+
+function mapRow(row) {
+  return {
+    id: row.id, casa: row.casa, modelo: row.modelo,
+    cerrada: Number(row.cerrada), ducto: Number(row.ducto), cochera: Number(row.cochera),
+    pilas: Number(row.pilas), azotea: Number(row.azotea), lote: Number(row.lote),
+    costoDirecto: Number(row.costo_directo), costoIndirecto: Number(row.costo_indirecto),
+    postventa: Number(row.postventa), precioVenta: Number(row.precio_venta), precioLote: Number(row.precio_lote),
+  };
+}
+
+/* ============================================================ */
+/*  ESTADO GLOBAL                                                */
+/* ============================================================ */
+const state = {
+  houses: [],
+  loading: true,
+  session: null,
+  activeTab: "formulario",
+  form: { ...emptyForm },
+  errors: {},
+  toast: null,
+  submitting: false,
+  historialSearch: "",
+  historialModelo: "Todos",
+  dashboardSearch: "",
+  showLogin: false,
+  loginError: "",
+  loginBusy: false,
+};
+
+let costChartInstance = null;
+let ratioChartInstance = null;
+
+/* ============================================================ */
+/*  CARGA DE DATOS + REALTIME                                    */
+/* ============================================================ */
+async function loadHouses() {
+  const { data, error } = await sb.from("presupuestos").select("*").order("casa", { ascending: true });
+  if (!error) state.houses = (data || []).map(mapRow);
+  state.loading = false;
+  render();
+}
+
+sb.auth.getSession().then(({ data }) => { state.session = data.session; render(); });
+sb.auth.onAuthStateChange((_event, session) => { state.session = session; render(); });
+
+sb.channel("public:presupuestos")
+  .on("postgres_changes", { event: "*", schema: "public", table: "presupuestos" }, () => loadHouses())
+  .subscribe();
+
+loadHouses();
+
+/* ============================================================ */
+/*  DERIVADOS (equivalentes a los useMemo de la versión React)   */
+/* ============================================================ */
+function getRowsWithStatus() {
+  const rows = state.houses.map(h => ({ ...h, ...calcDerived(h) }));
+  const modelStats = {};
+  rows.forEach(r => {
+    if (!modelStats[r.modelo]) modelStats[r.modelo] = { sum: 0, count: 0 };
+    modelStats[r.modelo].sum += r.ratioIndirecto;
+    modelStats[r.modelo].count += 1;
+  });
+  Object.keys(modelStats).forEach(m => modelStats[m].avg = modelStats[m].sum / modelStats[m].count);
+
+  const globalAvgRatio = rows.length ? rows.reduce((a, r) => a + r.ratioIndirecto, 0) / rows.length : 0;
+
+  const rowsWithStatus = rows.map(r => {
+    const st = modelStats[r.modelo];
+    let status = "neutral";
+    if (st && st.count >= 2) {
+      if (r.ratioIndirecto > st.avg * 1.1) status = "red";
+      else if (r.ratioIndirecto > st.avg) status = "yellow";
+      else status = "green";
+    }
+    return { ...r, status };
+  });
+
+  return { rows, rowsWithStatus, modelStats, globalAvgRatio };
+}
+
+function getModelos() {
+  return Array.from(new Set(state.houses.map(h => h.modelo))).sort();
+}
+
+/* ============================================================ */
+/*  BADGES / COMPONENTES DE TEXTO                                */
+/* ============================================================ */
+function statusBadge(status) {
+  const map = {
+    red: { label: "Crítico", cls: "bg-red-50 text-red-700 border-red-300" },
+    yellow: { label: "Atención", cls: "bg-amber-50 text-amber-700 border-amber-300" },
+    green: { label: "Óptimo", cls: "bg-emerald-50 text-emerald-700 border-emerald-300" },
+    neutral: { label: "Sin ref.", cls: "bg-slate-100 text-slate-500 border-slate-300" },
+  };
+  const { label, cls } = map[status] || map.neutral;
+  return `<span class="inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium ${cls}">${label}</span>`;
+}
+
+const ICONS = {
+  coins: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"></circle><path d="M18.09 10.37A6 6 0 1 1 10.34 18"></path><path d="M7 6h1v4"></path><path d="m16.71 13.88.7.71-2.82 2.82"></path></svg>',
+  ruler: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.4 2.4 0 0 1 0-3.4l2.6-2.6a2.4 2.4 0 0 1 3.4 0Z"></path><path d="m14.5 12.5 2-2"></path><path d="m11.5 9.5 2-2"></path><path d="m8.5 6.5 2-2"></path><path d="m17.5 15.5 2-2"></path></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>',
+  alert: '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>',
+};
+
+function kpiCard(label, value, sub, accentColor, iconKey) {
+  return `
+    <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div class="flex items-start justify-between">
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wide text-slate-500">${esc(label)}</p>
+          <p class="mt-2 text-2xl font-bold text-slate-800 mono">${value}</p>
+          ${sub ? `<p class="mt-1 text-xs text-slate-400">${sub}</p>` : ""}
+        </div>
+        <div class="rounded-lg p-2.5" style="background:${accentColor}">
+          <div class="h-5 w-5">${ICONS[iconKey] || ""}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* ============================================================ */
+/*  RENDER: LAYOUT GENERAL                                       */
+/* ============================================================ */
+function render() {
+  if (state.loading) {
+    document.getElementById("app").innerHTML = `<div class="flex h-screen items-center justify-center text-slate-400">Cargando consolidado...</div>`;
+    return;
+  }
+  document.getElementById("app").innerHTML = `
+    ${renderHeader()}
+    ${renderNav()}
+    <main class="mx-auto max-w-7xl px-6 py-8">
+      ${state.activeTab === "formulario" ? renderFormulario() : ""}
+      ${state.activeTab === "historial" ? renderHistorial() : ""}
+      ${state.activeTab === "dashboard" ? renderDashboard() : ""}
+    </main>
+    ${state.toast ? `<div class="fixed bottom-6 right-6 rounded-lg bg-slate-900 px-4 py-3 text-sm text-white shadow-lg">${esc(state.toast)}</div>` : ""}
+    ${state.showLogin ? renderLoginModal() : ""}
+  `;
+  if (state.activeTab === "dashboard") requestAnimationFrame(drawCharts);
+}
+
+function renderHeader() {
+  return `
+  <header class="relative overflow-hidden border-b border-slate-800 bg-slate-900 px-6 py-8 text-white"
+    style="background-image: repeating-linear-gradient(0deg, rgba(255,255,255,0.045) 0px, rgba(255,255,255,0.045) 1px, transparent 1px, transparent 32px), repeating-linear-gradient(90deg, rgba(255,255,255,0.045) 0px, rgba(255,255,255,0.045) 1px, transparent 1px, transparent 32px);">
+    <div class="mx-auto flex max-w-7xl items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <div class="rounded-lg bg-amber-600 p-2.5 text-lg">🏗️</div>
+        <div>
+          <h1 class="display text-2xl font-bold tracking-tight">Consolidado de Presupuestos</h1>
+          <p class="text-sm text-slate-300">Control de costos, áreas y márgenes por casa · ${state.houses.length} presupuestos cargados</p>
+        </div>
+      </div>
+      <div>
+        ${state.session
+          ? `<div class="flex items-center gap-3 text-sm">
+               <span class="hidden text-slate-300 sm:inline">${esc(state.session.user.email)}</span>
+               <button onclick="handleLogout()" class="rounded-lg bg-slate-800 px-3 py-1.5 font-medium hover:bg-slate-700">Cerrar sesión</button>
+             </div>`
+          : `<div class="flex items-center gap-3">
+               <span class="hidden rounded-full border border-slate-600 px-3 py-1 text-xs text-slate-300 sm:inline">👁️ Modo invitado · solo lectura</span>
+               <button onclick="openLogin()" class="rounded-lg bg-slate-800 px-3 py-1.5 text-sm font-medium hover:bg-slate-700">Iniciar sesión</button>
+             </div>`
+        }
+      </div>
+    </div>
+  </header>`;
+}
+
+function renderNav() {
+  const tabs = [
+    { id: "formulario", label: "Formulario de Entrada" },
+    { id: "historial", label: "Historial de Datos" },
+    { id: "dashboard", label: "Panel de Eficiencia y Costos" },
+  ];
+  return `
+  <nav class="border-b border-slate-200 bg-white px-6">
+    <div class="mx-auto flex max-w-7xl gap-1">
+      ${tabs.map(t => `
+        <button onclick="setTab('${t.id}')"
+          class="border-b-2 px-4 py-3.5 text-sm font-medium transition ${state.activeTab === t.id ? "border-amber-600 text-amber-700" : "border-transparent text-slate-500 hover:text-slate-800"}">
+          ${t.label}
+        </button>
+      `).join("")}
+    </div>
+  </nav>`;
+}
+
+function setTab(id) { state.activeTab = id; render(); }
+
+/* ============================================================ */
+/*  RENDER: FORMULARIO DE ENTRADA                                */
+/* ============================================================ */
+function fieldInput(name, prefix) {
+  const value = esc(state.form[name]);
+  const error = state.errors[name];
+  const evaluated = safeEvalMath(state.form[name]);
+  const isExpression = /[+\-*/()]/.test(state.form[name] || "") && !isNaN(evaluated);
+  return `
+    <div>
+      <label class="mb-1 block text-xs font-medium text-slate-600">${FIELD_LABELS[name]}</label>
+      <div class="relative">
+        ${prefix ? `<span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">${prefix}</span>` : ""}
+        <input type="text" inputmode="decimal" id="field-${name}" value="${value}" oninput="handleFormChange('${name}', this.value)"
+          class="w-full rounded-lg border ${error ? "border-red-400" : "border-slate-300"} bg-white py-2 text-sm text-slate-800 outline-none transition focus:ring-2 focus:ring-slate-200 ${prefix ? "pl-7 pr-3" : "px-3"}"
+          placeholder="0.00 o ej. 2+3.5" />
+      </div>
+      <p id="field-${name}-result" class="mt-1 text-xs font-medium text-amber-700" style="${isExpression ? "" : "display:none;"}">= ${isExpression ? fmtNum(evaluated) : ""}</p>
+      ${error ? `<p class="mt-1 text-xs text-red-500">${esc(error)}</p>` : ""}
+    </div>`;
+}
+
+function renderFormulario() {
+  if (!state.session) {
+    return `
+      <div class="mx-auto max-w-md rounded-xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+        <p class="mb-4 text-sm text-slate-500">Necesitas iniciar sesión para agregar presupuestos. El Historial y el Dashboard son públicos, pero solo el administrador puede editar datos.</p>
+        <button onclick="openLogin()" class="rounded-lg bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-amber-700">Iniciar sesión</button>
+      </div>`;
+  }
+
+  const d = calcDerived({
+    cerrada: safeEvalMath(state.form.cerrada) || 0, ducto: safeEvalMath(state.form.ducto) || 0,
+    cochera: safeEvalMath(state.form.cochera) || 0, pilas: safeEvalMath(state.form.pilas) || 0,
+    azotea: safeEvalMath(state.form.azotea) || 0, lote: safeEvalMath(state.form.lote) || 0,
+    costoDirecto: safeEvalMath(state.form.costoDirecto) || 0, costoIndirecto: safeEvalMath(state.form.costoIndirecto) || 0,
+    postventa: safeEvalMath(state.form.postventa) || 0, precioVenta: safeEvalMath(state.form.precioVenta) || 0,
+    precioLote: safeEvalMath(state.form.precioLote) || 0,
+  });
+
+  const modelos = getModelos();
+
+  return `
+  <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
+    <form onsubmit="handleSubmit(event)" class="space-y-6 lg:col-span-2">
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Identificación</h2>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Casa (código)</label>
+            <input type="text" id="field-casa" value="${esc(state.form.casa)}" oninput="handleFormChange('casa', this.value)"
+              placeholder="Ej. VN-K.30"
+              class="w-full rounded-lg border ${state.errors.casa ? "border-red-400" : "border-slate-300"} px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            ${state.errors.casa ? `<p class="mt-1 text-xs text-red-500">${esc(state.errors.casa)}</p>` : ""}
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Modelo</label>
+            <input type="text" id="field-modelo" list="modelos-list" value="${esc(state.form.modelo)}" oninput="handleFormChange('modelo', this.value)"
+              placeholder="Ej. Tebas Azotea"
+              class="w-full rounded-lg border ${state.errors.modelo ? "border-red-400" : "border-slate-300"} px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            <datalist id="modelos-list">${modelos.map(m => `<option value="${esc(m)}">`).join("")}</datalist>
+            ${state.errors.modelo ? `<p class="mt-1 text-xs text-red-500">${esc(state.errors.modelo)}</p>` : ""}
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Áreas (m²)</h2>
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
+          ${AREA_FIELDS.map(f => fieldInput(f)).join("")}
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Datos Financieros</h2>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          ${MONEY_FIELDS.map(f => fieldInput(f, "₡")).join("")}
+        </div>
+      </div>
+
+      <button type="submit" ${state.submitting ? "disabled" : ""}
+        class="flex items-center gap-2 rounded-lg bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-amber-700 disabled:opacity-60">
+        ${state.submitting ? "Guardando..." : "+ Agregar Presupuesto"}
+      </button>
+    </form>
+
+    <div class="lg:col-span-1">
+      <div class="sticky top-6 rounded-xl border border-slate-200 bg-slate-900 p-6 text-white shadow-sm">
+        <h3 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-400">Cálculo Automático</h3>
+        <dl class="mono space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+            <dt class="text-xs text-slate-400">Área Total</dt><dd id="calc-area-total" class="text-lg font-semibold">${fmtNum(d.areaTotal)} m²</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+            <dt class="text-xs text-slate-400">Área Prorrateada</dt><dd id="calc-area-prorrateada" class="text-lg font-semibold">${fmtNum(d.areaProrrateada)} m²</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+            <dt class="text-xs text-slate-400">% de Indirectos</dt><dd id="calc-ratio" class="text-lg font-semibold">${fmtPct(d.ratioIndirecto * 100)}</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+            <dt class="text-xs text-slate-400">Costo Directo / m²</dt><dd id="calc-costo-m2" class="text-lg font-semibold">₡${fmtNum(d.costoDirectoM2, 0)}</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+            <dt class="text-xs text-slate-400">Utilidad Estimada</dt><dd id="calc-utilidad" class="text-lg font-semibold ${d.utilidad < 0 ? "text-red-400" : "text-emerald-400"}">₡${fmtMoney(d.utilidad)}</dd>
+          </div>
+          <div class="flex items-center justify-between">
+            <dt class="text-xs text-slate-400">Margen</dt><dd id="calc-margen" class="text-lg font-semibold ${d.margenPct < 0 ? "text-red-400" : "text-emerald-400"}">${fmtPct(d.margenPct)}</dd>
+          </div>
+        </dl>
+        <p class="mt-5 text-xs leading-relaxed text-slate-500">Área Prorrateada = Cerrada + Ducto + 0.5×Cochera + 0.5×Pilas/Terraza + 0.35×Azotea</p>
+      </div>
+    </div>
+  </div>`;
+}
+
+function handleFormChange(name, value) {
+  state.form[name] = value;
+
+  // Si el campo es de área o financiero, muestra el resultado calculado debajo (ej. "2+3.5" -> "= 5.50")
+  const resultEl = document.getElementById(`field-${name}-result`);
+  if (resultEl) {
+    const evaluated = safeEvalMath(value);
+    const isExpression = /[+\-*/()]/.test(value || "") && !isNaN(evaluated);
+    resultEl.style.display = isExpression ? "" : "none";
+    resultEl.textContent = isExpression ? "= " + fmtNum(evaluated) : "";
+  }
+
+  // Actualiza solo el panel de cálculo, sin re-renderizar todo (evita perder el foco al escribir)
+  const d = calcDerived({
+    cerrada: safeEvalMath(state.form.cerrada) || 0, ducto: safeEvalMath(state.form.ducto) || 0,
+    cochera: safeEvalMath(state.form.cochera) || 0, pilas: safeEvalMath(state.form.pilas) || 0,
+    azotea: safeEvalMath(state.form.azotea) || 0, lote: safeEvalMath(state.form.lote) || 0,
+    costoDirecto: safeEvalMath(state.form.costoDirecto) || 0, costoIndirecto: safeEvalMath(state.form.costoIndirecto) || 0,
+    postventa: safeEvalMath(state.form.postventa) || 0, precioVenta: safeEvalMath(state.form.precioVenta) || 0,
+    precioLote: safeEvalMath(state.form.precioLote) || 0,
+  });
+  document.getElementById("calc-area-total").textContent = fmtNum(d.areaTotal) + " m²";
+  document.getElementById("calc-area-prorrateada").textContent = fmtNum(d.areaProrrateada) + " m²";
+  document.getElementById("calc-ratio").textContent = fmtPct(d.ratioIndirecto * 100);
+  document.getElementById("calc-costo-m2").textContent = "₡" + fmtNum(d.costoDirectoM2, 0);
+  const util = document.getElementById("calc-utilidad");
+  util.textContent = "₡" + fmtMoney(d.utilidad);
+  util.className = "text-lg font-semibold " + (d.utilidad < 0 ? "text-red-400" : "text-emerald-400");
+  const margen = document.getElementById("calc-margen");
+  margen.textContent = fmtPct(d.margenPct);
+  margen.className = "text-lg font-semibold " + (d.margenPct < 0 ? "text-red-400" : "text-emerald-400");
+}
+
+function validateForm() {
+  const errs = {};
+  if (!state.form.casa.trim()) errs.casa = "El código de casa es obligatorio.";
+  else if (state.houses.some(h => h.casa.toLowerCase() === state.form.casa.trim().toLowerCase())) errs.casa = "Ya existe una casa con este código.";
+  if (!state.form.modelo.trim()) errs.modelo = "El modelo es obligatorio.";
+
+  [...AREA_FIELDS, ...MONEY_FIELDS].forEach(k => {
+    const raw = state.form[k];
+    if (raw === "" || raw === null) { errs[k] = "Requerido."; return; }
+    const v = safeEvalMath(raw);
+    if (isNaN(v) || v < 0) errs[k] = "Debe ser un número (o una operación como 2+3) ≥ 0.";
+  });
+  if (safeEvalMath(state.form.precioVenta) <= 0) errs.precioVenta = "El precio de venta debe ser mayor a 0.";
+  if (safeEvalMath(state.form.costoDirecto) <= 0) errs.costoDirecto = "El costo directo debe ser mayor a 0.";
+
+  state.errors = errs;
+  return Object.keys(errs).length === 0;
+}
+
+async function handleSubmit(e) {
+  e.preventDefault();
+  if (!validateForm()) { render(); return; }
+  state.submitting = true; render();
+
+  const row = {
+    casa: state.form.casa.trim(), modelo: state.form.modelo.trim(),
+    cerrada: safeEvalMath(state.form.cerrada), ducto: safeEvalMath(state.form.ducto),
+    cochera: safeEvalMath(state.form.cochera), pilas: safeEvalMath(state.form.pilas),
+    azotea: safeEvalMath(state.form.azotea), lote: safeEvalMath(state.form.lote),
+    costo_directo: safeEvalMath(state.form.costoDirecto), costo_indirecto: safeEvalMath(state.form.costoIndirecto),
+    postventa: safeEvalMath(state.form.postventa), precio_venta: safeEvalMath(state.form.precioVenta),
+    precio_lote: safeEvalMath(state.form.precioLote),
+  };
+
+  const { error } = await sb.from("presupuestos").insert(row);
+  state.submitting = false;
+
+  if (error) {
+    state.errors = { casa: "Error al guardar: " + error.message };
+    render();
+    return;
+  }
+
+  state.form = { ...emptyForm };
+  state.errors = {};
+  state.toast = `Presupuesto para "${row.casa}" agregado correctamente.`;
+  await loadHouses();
+  setTimeout(() => { state.toast = null; render(); }, 3500);
+}
+
+/* ============================================================ */
+/*  RENDER: HISTORIAL DE DATOS                                   */
+/* ============================================================ */
+function renderHistorial() {
+  const modelos = getModelos();
+  return `
+  <div>
+    <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div class="relative w-full sm:w-72">
+        <input type="text" id="historial-search" value="${esc(state.historialSearch)}" oninput="handleHistorialSearch(this.value)"
+          placeholder="Buscar por código de casa..."
+          class="w-full rounded-lg border border-slate-300 py-2 pl-3 pr-3 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200" />
+      </div>
+      <select onchange="handleHistorialModelo(this.value)" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200 sm:w-56">
+        <option ${state.historialModelo === "Todos" ? "selected" : ""}>Todos</option>
+        ${modelos.map(m => `<option ${state.historialModelo === m ? "selected" : ""}>${esc(m)}</option>`).join("")}
+      </select>
+    </div>
+    <div id="historial-table-container">${renderHistorialTable()}</div>
+  </div>`;
+}
+
+function renderHistorialTable() {
+  const { rowsWithStatus } = getRowsWithStatus();
+  const filtered = rowsWithStatus.filter(r => {
+    const matchModelo = state.historialModelo === "Todos" || r.modelo === state.historialModelo;
+    const matchSearch = r.casa.toLowerCase().includes(state.historialSearch.toLowerCase());
+    return matchModelo && matchSearch;
+  });
+
+  return `
+  <div class="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+    <table class="w-full min-w-[1100px] text-left text-sm">
+      <thead>
+        <tr class="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+          <th class="px-4 py-3 font-semibold">Casa</th><th class="px-4 py-3 font-semibold">Modelo</th>
+          <th class="px-4 py-3 text-right font-semibold">Área Total</th><th class="px-4 py-3 text-right font-semibold">Área Prorr.</th>
+          <th class="px-4 py-3 text-right font-semibold">Costo Directo</th><th class="px-4 py-3 text-right font-semibold">Costo Indirecto</th>
+          <th class="px-4 py-3 text-right font-semibold">% Indirectos</th><th class="px-4 py-3 text-right font-semibold">Precio Venta</th>
+          <th class="px-4 py-3 text-right font-semibold">Margen</th><th class="px-4 py-3 font-semibold">Estado</th>
+        </tr>
+      </thead>
+      <tbody class="mono">
+        ${filtered.map(r => `
+          <tr class="border-b border-slate-100 last:border-0 hover:bg-slate-50 ${r.status === "red" ? "bg-red-50/40" : r.status === "yellow" ? "bg-amber-50/40" : ""}">
+            <td class="px-4 py-2.5 font-semibold text-slate-800">${esc(r.casa)}</td>
+            <td class="px-4 py-2.5 text-slate-600" style="font-family:'Inter',sans-serif;">${esc(r.modelo)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.areaTotal)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.areaProrrateada)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.costoDirecto)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.costoIndirecto)}</td>
+            <td class="px-4 py-2.5 text-right font-semibold">${fmtPct(r.ratioIndirecto * 100)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.precioVenta)}</td>
+            <td class="px-4 py-2.5 text-right font-semibold ${r.margenPct < 0 ? "text-red-600" : "text-emerald-600"}">${fmtPct(r.margenPct)}</td>
+            <td class="px-4 py-2.5">${statusBadge(r.status)}</td>
+          </tr>`).join("")}
+        ${filtered.length === 0 ? `<tr><td colspan="10" class="px-4 py-8 text-center text-slate-400" style="font-family:'Inter',sans-serif;">No hay presupuestos que coincidan con la búsqueda.</td></tr>` : ""}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+function handleHistorialSearch(value) {
+  state.historialSearch = value;
+  document.getElementById("historial-table-container").innerHTML = renderHistorialTable();
+}
+function handleHistorialModelo(value) {
+  state.historialModelo = value;
+  document.getElementById("historial-table-container").innerHTML = renderHistorialTable();
+}
+
+/* ============================================================ */
+/*  RENDER: PANEL DE EFICIENCIA Y COSTOS                         */
+/* ============================================================ */
+function getModelStatus(ratioDecimal, globalAvgRatio) {
+  if (!globalAvgRatio) return "neutral";
+  if (ratioDecimal > globalAvgRatio * 1.1) return "red";
+  if (ratioDecimal > globalAvgRatio) return "yellow";
+  return "green";
+}
+
+function getModelChartData() {
+  const { rowsWithStatus, globalAvgRatio } = getRowsWithStatus();
+  const grouped = {};
+  rowsWithStatus.forEach(r => {
+    if (!grouped[r.modelo]) grouped[r.modelo] = { modelo: r.modelo, count: 0, directoSum: 0, indirectoSum: 0, utilidadSum: 0, ratioSum: 0 };
+    const g = grouped[r.modelo];
+    g.count++; g.directoSum += r.costoDirecto; g.indirectoSum += r.costoIndirecto; g.utilidadSum += r.utilidad; g.ratioSum += r.ratioIndirecto;
+  });
+  const modelChartData = Object.values(grouped).map(g => {
+    const ratioAvg = g.ratioSum / g.count;
+    return {
+      modelo: g.modelo, count: g.count,
+      DirectoProm: Math.round(g.directoSum / g.count), IndirectoProm: Math.round(g.indirectoSum / g.count),
+      UtilidadProm: Math.round(g.utilidadSum / g.count), ratioPct: ratioAvg * 100,
+      status: getModelStatus(ratioAvg, globalAvgRatio),
+    };
+  }).sort((a, b) => b.ratioPct - a.ratioPct);
+  const costChartData = [...modelChartData].sort((a, b) => b.DirectoProm - a.DirectoProm);
+  return { modelChartData, costChartData, globalAvgRatio };
+}
+
+function getModelAverages(rows) {
+  const grouped = {};
+  rows.forEach(r => {
+    if (!grouped[r.modelo]) grouped[r.modelo] = { count: 0, costoDirectoSum: 0, utilidadSum: 0 };
+    grouped[r.modelo].count++; grouped[r.modelo].costoDirectoSum += r.costoDirecto; grouped[r.modelo].utilidadSum += r.utilidad;
+  });
+  const result = {};
+  Object.entries(grouped).forEach(([modelo, g]) => { result[modelo] = { avgCostoDirecto: g.costoDirectoSum / g.count, avgUtilidad: g.utilidadSum / g.count }; });
+  return result;
+}
+
+function renderDashboard() {
+  return `
+  <div class="space-y-6">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div>
+        <h2 class="text-sm font-semibold text-slate-700">Indicadores de Eficiencia</h2>
+        <p class="text-xs text-slate-400">Busca una casa para ver sus indicadores; los gráficos por modelo siempre muestran todo el consolidado</p>
+      </div>
+      <div class="relative w-full sm:w-72">
+        <input type="text" id="dashboard-search" value="${esc(state.dashboardSearch)}" oninput="handleDashboardSearch(this.value)"
+          placeholder="Buscar por código de casa..."
+          class="w-full rounded-lg border border-slate-300 py-2 pl-3 pr-3 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200" />
+      </div>
+    </div>
+
+    <div id="dashboard-kpis">${renderDashboardKpis()}</div>
+
+    <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h3 class="mb-1 text-sm font-semibold text-slate-700">Composición Promedio de Costos por Modelo</h3>
+      <p class="mb-4 text-xs text-slate-400">Costo Directo, Costo Indirecto y Utilidad promedio por casa (₡) · todos los modelos, sin filtrar</p>
+      <div style="height:320px;"><canvas id="chart-cost"></canvas></div>
+    </div>
+
+    <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h3 class="mb-1 text-sm font-semibold text-slate-700">% de Costo Indirecto por Modelo</h3>
+      <p id="ratio-chart-sub" class="mb-4 text-xs text-slate-400"></p>
+      <div style="height:320px;"><canvas id="chart-ratio"></canvas></div>
+      <div class="mt-4 flex flex-wrap gap-4 text-xs text-slate-500">
+        <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-emerald-600"></span> Dentro del promedio global</span>
+        <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-amber-600"></span> Hasta 10% sobre el promedio global</span>
+        <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-full bg-red-600"></span> Más de 10% sobre el promedio global</span>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h3 class="mb-4 text-sm font-semibold text-slate-700">Ratio Promedio por Modelo</h3>
+        <div class="space-y-2">${renderModelRatioList()}</div>
+      </div>
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h3 class="mb-4 text-sm font-semibold text-slate-700">Presupuestos que Requieren Revisión</h3>
+        <div id="dashboard-alerts">${renderDashboardAlerts()}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderDashboardKpis() {
+  const { rowsWithStatus, rows } = getRowsWithStatus();
+  const dashboardRows = rowsWithStatus.filter(r => r.casa.toLowerCase().includes(state.dashboardSearch.toLowerCase()));
+
+  const kpiAvgRatio = dashboardRows.length ? dashboardRows.reduce((a, r) => a + r.ratioIndirecto, 0) / dashboardRows.length : 0;
+  const kpiAvgMargen = dashboardRows.length ? dashboardRows.reduce((a, r) => a + r.margenPct, 0) / dashboardRows.length : 0;
+
+  const modelAverages = getModelAverages(rows);
+  const globalAvgCostoDirecto = rows.length ? rows.reduce((a, r) => a + r.costoDirecto, 0) / rows.length : 0;
+  const globalAvgUtilidad = rows.length ? rows.reduce((a, r) => a + r.utilidad, 0) / rows.length : 0;
+
+  const comparisonRow = state.dashboardSearch.trim() && dashboardRows.length === 1 ? dashboardRows[0] : null;
+
+  let costoComp = { value: globalAvgCostoDirecto, delta: null };
+  let utilComp = { value: globalAvgUtilidad, delta: null };
+  if (comparisonRow) {
+    const mAvgC = modelAverages[comparisonRow.modelo]?.avgCostoDirecto ?? 0;
+    const deltaC = comparisonRow.costoDirecto - mAvgC;
+    costoComp = { value: mAvgC, delta: deltaC, deltaPct: mAvgC > 0 ? (deltaC / mAvgC) * 100 : 0, modelo: comparisonRow.modelo, own: comparisonRow.costoDirecto };
+
+    const mAvgU = modelAverages[comparisonRow.modelo]?.avgUtilidad ?? 0;
+    const deltaU = comparisonRow.utilidad - mAvgU;
+    utilComp = { value: mAvgU, delta: deltaU, deltaPct: mAvgU !== 0 ? (deltaU / Math.abs(mAvgU)) * 100 : 0, modelo: comparisonRow.modelo, own: comparisonRow.utilidad };
+  }
+
+  const costoSub = costoComp.delta === null
+    ? "Promedio general · busca una casa para comparar contra su modelo"
+    : `${esc(costoComp.modelo)} · tu casa: ₡${fmtMoney(costoComp.own)} <span class="font-semibold ${costoComp.delta > 0 ? "text-red-600" : "text-emerald-600"}">(${costoComp.delta > 0 ? "+" : ""}${fmtNum(costoComp.deltaPct, 1)}%)</span>`;
+
+  const utilSub = utilComp.delta === null
+    ? "Promedio general · busca una casa para comparar contra su modelo"
+    : `${esc(utilComp.modelo)} · tu casa: ₡${fmtMoney(utilComp.own)} <span class="font-semibold ${utilComp.delta >= 0 ? "text-emerald-600" : "text-red-600"}">(${utilComp.delta >= 0 ? "+" : ""}${fmtNum(utilComp.deltaPct, 1)}%)</span>`;
+
+  return `
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      ${kpiCard("% de Indirectos", fmtPct(kpiAvgRatio * 100), "Costo Indirecto / (Precio Venta - Precio Lote)", "#d97706", "coins")}
+      ${kpiCard("Costo Directo Promedio", "₡" + fmtMoney(costoComp.value), costoSub, "#334155", "ruler")}
+      ${kpiCard("Utilidad", fmtPct(kpiAvgMargen), `${dashboardRows.length} presupuesto${dashboardRows.length !== 1 ? "s" : ""} analizado${dashboardRows.length !== 1 ? "s" : ""}`, "#059669", "check")}
+      ${kpiCard("Utilidad vs Promedio del Modelo", "₡" + fmtMoney(utilComp.value), utilSub, "#dc2626", "alert")}
+    </div>`;
+}
+
+function renderDashboardAlerts() {
+  const { rowsWithStatus, modelStats } = getRowsWithStatus();
+  const alerts = rowsWithStatus
+    .filter(r => r.status === "red" || r.status === "yellow")
+    .filter(r => r.casa.toLowerCase().includes(state.dashboardSearch.toLowerCase()))
+    .sort((a, b) => b.ratioIndirecto - a.ratioIndirecto);
+
+  if (alerts.length === 0) return `<p class="text-sm text-slate-400">No hay presupuestos fuera de rango por el momento.</p>`;
+
+  return `<div class="space-y-2">${alerts.map(r => {
+    const avg = modelStats[r.modelo]?.avg ?? 0;
+    const delta = avg > 0 ? ((r.ratioIndirecto - avg) / avg) * 100 : 0;
+    return `
+      <div class="flex items-center justify-between rounded-lg border px-3 py-2 text-sm ${r.status === "red" ? "border-red-200 bg-red-50" : "border-amber-200 bg-amber-50"}">
+        <div>
+          <p class="font-medium text-slate-800">${esc(r.casa)} <span class="text-slate-400">· ${esc(r.modelo)}</span></p>
+          <p class="text-xs text-slate-500">% Indirectos ${fmtPct(r.ratioIndirecto * 100)} — ${delta >= 0 ? "+" : ""}${fmtNum(delta, 1)}% vs. promedio del modelo</p>
+        </div>
+        ${statusBadge(r.status)}
+      </div>`;
+  }).join("")}</div>`;
+}
+
+function renderModelRatioList() {
+  const { modelStats } = getRowsWithStatus();
+  return Object.entries(modelStats).sort((a, b) => b[1].avg - a[1].avg).map(([modelo, s]) => `
+    <div class="flex items-center justify-between rounded-lg border border-slate-100 px-3 py-2 text-sm">
+      <div><p class="font-medium text-slate-700">${esc(modelo)}</p><p class="text-xs text-slate-400">${s.count} presupuesto${s.count !== 1 ? "s" : ""}</p></div>
+      <span class="mono font-semibold text-slate-800">${fmtPct(s.avg * 100)}</span>
+    </div>`).join("");
+}
+
+function handleDashboardSearch(value) {
+  state.dashboardSearch = value;
+  document.getElementById("dashboard-kpis").innerHTML = renderDashboardKpis();
+  document.getElementById("dashboard-alerts").innerHTML = renderDashboardAlerts();
+}
+
+/* ============================================================ */
+/*  GRÁFICOS (Chart.js) — siempre con TODOS los modelos          */
+/* ============================================================ */
+function drawCharts() {
+  const { modelChartData, costChartData, globalAvgRatio } = getModelChartData();
+  const statusColor = { red: "#dc2626", yellow: "#d97706", green: "#059669", neutral: "#94a3b8" };
+
+  const sub = document.getElementById("ratio-chart-sub");
+  if (sub) sub.textContent = `Línea punteada = promedio global de todos los modelos (${fmtPct(globalAvgRatio * 100)}). Muestra todos los modelos, sin filtrar por búsqueda.`;
+
+  const costCtx = document.getElementById("chart-cost");
+  if (costChartInstance) costChartInstance.destroy();
+  if (costCtx) {
+    costChartInstance = new Chart(costCtx, {
+      type: "bar",
+      data: {
+        labels: costChartData.map(d => d.modelo),
+        datasets: [
+          { label: "Costo Directo Prom.", data: costChartData.map(d => d.DirectoProm), backgroundColor: "#475569", stack: "a" },
+          { label: "Costo Indirecto Prom.", data: costChartData.map(d => d.IndirectoProm), backgroundColor: "#d97706", stack: "a" },
+          { label: "Utilidad Prom.", data: costChartData.map(d => d.UtilidadProm), backgroundColor: "#059669", stack: "a" },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { stacked: true, ticks: { font: { size: 11 } } },
+          y: { stacked: true, ticks: { callback: v => (v / 1e6).toFixed(0) + "M", font: { size: 11 } } },
+        },
+        plugins: { tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ₡${fmtMoney(ctx.raw)}` } } },
+      },
+    });
+  }
+
+  const ratioCtx = document.getElementById("chart-ratio");
+  if (ratioChartInstance) ratioChartInstance.destroy();
+  if (ratioCtx) {
+    ratioChartInstance = new Chart(ratioCtx, {
+      type: "bar",
+      data: {
+        labels: modelChartData.map(d => d.modelo),
+        datasets: [{
+          label: "% Indirectos",
+          data: modelChartData.map(d => d.ratioPct),
+          backgroundColor: modelChartData.map(d => statusColor[d.status]),
+        }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { ticks: { font: { size: 11 } } },
+          y: { ticks: { callback: v => v.toFixed(0) + "%", font: { size: 11 } } },
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => `% Indirectos: ${fmtPct(ctx.raw)}` } },
+          annotationLine: true,
+        },
+      },
+      plugins: [{
+        id: "avgLine",
+        afterDraw(chart) {
+          const { ctx, chartArea, scales } = chart;
+          const y = scales.y.getPixelForValue(globalAvgRatio * 100);
+          ctx.save();
+          ctx.setLineDash([5, 5]);
+          ctx.strokeStyle = "#1e293b";
+          ctx.beginPath();
+          ctx.moveTo(chartArea.left, y);
+          ctx.lineTo(chartArea.right, y);
+          ctx.stroke();
+          ctx.restore();
+        },
+      }],
+    });
+  }
+}
+
+/* ============================================================ */
+/*  AUTENTICACIÓN                                                */
+/* ============================================================ */
+function openLogin() { state.showLogin = true; state.loginError = ""; render(); }
+function closeLogin() { state.showLogin = false; render(); }
+
+function renderLoginModal() {
+  return `
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+    <div class="w-full max-w-sm rounded-xl bg-white p-6 shadow-xl">
+      <h3 class="mb-4 text-lg font-semibold text-slate-800">Iniciar sesión</h3>
+      <div class="space-y-3">
+        <input type="email" id="login-email" placeholder="Correo" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+        <input type="password" id="login-password" placeholder="Contraseña" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+        ${state.loginError ? `<p class="text-xs text-red-500">${esc(state.loginError)}</p>` : ""}
+        <div class="flex gap-2 pt-2">
+          <button onclick="handleLogin()" ${state.loginBusy ? "disabled" : ""} class="flex-1 rounded-lg bg-amber-600 px-4 py-2 text-sm font-semibold text-white hover:bg-amber-700 disabled:opacity-60">${state.loginBusy ? "Ingresando..." : "Ingresar"}</button>
+          <button onclick="closeLogin()" class="flex-1 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function handleLogin() {
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+  state.loginBusy = true; render();
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  state.loginBusy = false;
+  if (error) { state.loginError = "Correo o contraseña incorrectos."; render(); return; }
+  state.showLogin = false;
+  render();
+}
+
+async function handleLogout() {
+  await sb.auth.signOut();
+  render();
+}
+</script>
+</body>
+</html>
