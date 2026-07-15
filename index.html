@@ -1,0 +1,1434 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Consolidado de Presupuestos</title>
+
+<!-- Tailwind (utilidades CSS) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<!-- Supabase (base de datos + autenticación) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<!-- Chart.js (gráficos) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Mono:wght@400;700&display=swap');
+
+  :root {
+    --bg:        #ffffff;
+    --surface:   #ffffff;
+    --chip:      #f2f2ef;
+    --ink:       #1c1813;
+    --dim:       #7a7568;
+    --line:      #e2e0d8;
+    --stroke:    #1c1813;
+    --orange:    #ADD010;
+    --orange-ink:#1c1813;
+    --olive:     #6b7a45;
+  }
+
+  body { font-family: 'Roboto', sans-serif; background: var(--bg); color: var(--ink); }
+  .mono { font-family: 'Roboto Mono', monospace; }
+  .display { font-family: 'Roboto', sans-serif; font-weight: 700; }
+  .serif-italic { font-family: 'Roboto', sans-serif; font-style: italic; font-weight: 500; }
+
+  /* Eyebrows / etiquetas mono */
+  .eyebrow { font-family: 'Roboto Mono', monospace; text-transform: uppercase; letter-spacing: 0.16em; font-size: 10px; color: var(--dim); }
+
+  /* Diamante naranja */
+  .diamond::before { content: ""; display: inline-block; width: 6px; height: 6px; background: var(--orange); transform: rotate(45deg); margin-right: 7px; vertical-align: middle; }
+
+  /* ---- Overrides de utilidades Tailwind para adoptar la paleta ---- */
+  .bg-white { background: var(--surface) !important; }
+  .bg-stone-50, .bg-slate-50 { background: var(--bg) !important; }
+  .bg-slate-100 { background: var(--chip) !important; }
+  .bg-slate-200 { background: var(--chip) !important; }
+
+  /* Bordes: outline bold, no sombras */
+  .border-slate-200, .border-slate-300, .border-slate-100 { border-color: var(--line) !important; }
+  .shadow-sm, .shadow-xl, .shadow-2xl, .shadow-lg { box-shadow: none !important; }
+  .rounded-xl { border-radius: 15px; }
+
+  /* Tarjetas con outline bold */
+  .peak-card { background: var(--surface); border: 1.5px solid var(--stroke); border-radius: 15px; }
+
+  /* Texto */
+  .text-slate-800, .text-slate-700 { color: var(--ink) !important; }
+  .text-slate-600, .text-slate-500, .text-slate-400 { color: var(--dim) !important; }
+
+  /* Header */
+  .peak-header { background: var(--ink); color: var(--surface); border-bottom: 2px solid var(--stroke); }
+
+  /* Inputs */
+  input, select { font-family: 'Space Grotesk', sans-serif; }
+  input:focus, select:focus { border-color: var(--orange) !important; }
+
+  /* Scroll horizontal contenido */
+  .overflow-x-auto { max-width: 100%; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<div id="app">
+  <div class="flex h-screen items-center justify-center" style="color:var(--dim)">Cargando consolidado...</div>
+</div>
+
+<script>
+/* ============================================================ */
+/*  CONFIGURACIÓN DE SUPABASE                                    */
+/* ============================================================ */
+const SUPABASE_URL = "https://kbvnpowjsegkqjjbqgqh.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtidm5wb3dqc2Vna3FqamJxZ3FoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0Mjc0NjIsImV4cCI6MjA5OTAwMzQ2Mn0.eCDCDrrALL-nppuIQjUwoN32nUVLt2JOcDX2BUYcaTI";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ============================================================ */
+/*  CONSTANTES Y CÁLCULOS (idénticos a la versión de Claude)     */
+/* ============================================================ */
+const PRORRATEO = { cerrada: 1, ducto: 1, cochera: 0.5, pilas: 0.5, azotea: 0.35 };
+
+// Valores de ajuste por m² para el estimador de costo directo (fijos)
+const AJUSTE_CERRADA = 310000;   // ₡/m² de diferencia en área cerrada
+const AJUSTE_EXTERIOR = 70000;   // ₡/m² de diferencia en (cochera + pila/terraza)
+const GREEN_USD_M2 = 5;          // USD por m² de área de lote (se suma al costo indirecto)
+
+const FIELD_LABELS = {
+  cerrada: "Área Cerrada (m²)", ducto: "Área Ducto (m²)", cochera: "Cochera (m²)",
+  pilas: "Pilas / Terraza (m²)", azotea: "Azotea (m²)", lote: "Área Lote (m²)",
+  costoDirecto: "Costo Directo (₡)", costoIndirecto: "Costo Indirecto (₡)",
+  postventa: "Postventa (₡)", precioVenta: "Precio Venta (₡)", precioLote: "Precio Lote (₡)",
+};
+const AREA_FIELDS = ["cerrada", "ducto", "cochera", "pilas", "azotea", "lote"];
+const MONEY_FIELDS = ["costoDirecto", "costoIndirecto", "postventa", "precioVenta", "precioLote"];
+const emptyForm = { ...Object.fromEntries(["casa", "modelo", ...AREA_FIELDS, ...MONEY_FIELDS].map(k => [k, ""])), tipoPresupuesto: "detallado", tipoCambio: "" };
+
+// Monto "green" = área de lote × 5 USD × tipo de cambio (₡/$). Se suma al costo indirecto.
+// Construye el objeto numérico del formulario. El costo indirecto YA incluye el green sumado.
+function formToNumbers() {
+  const f = state.form;
+  const lote = safeEvalMath(f.lote) || 0;
+  const green = calcGreen(lote, safeEvalMath(f.tipoCambio) || 0);
+  const indirectoBase = safeEvalMath(f.costoIndirecto) || 0;
+  return {
+    cerrada: safeEvalMath(f.cerrada) || 0, ducto: safeEvalMath(f.ducto) || 0,
+    cochera: safeEvalMath(f.cochera) || 0, pilas: safeEvalMath(f.pilas) || 0,
+    azotea: safeEvalMath(f.azotea) || 0, lote,
+    costoDirecto: safeEvalMath(f.costoDirecto) || 0,
+    costoIndirecto: indirectoBase + green,
+    postventa: safeEvalMath(f.postventa) || 0, precioVenta: safeEvalMath(f.precioVenta) || 0,
+    precioLote: safeEvalMath(f.precioLote) || 0,
+    _green: green, _indirectoBase: indirectoBase,
+  };
+}
+
+function calcGreen(loteM2, tipoCambio) {
+  const lote = Number(loteM2) || 0;
+  const tc = Number(tipoCambio) || 0;
+  return lote * GREEN_USD_M2 * tc;
+}
+
+function calcDerived(h) {
+  const areaTotal = h.cerrada + h.ducto + h.cochera + h.pilas + h.azotea;
+  const areaProrrateada = h.cerrada * PRORRATEO.cerrada + h.ducto * PRORRATEO.ducto +
+    h.cochera * PRORRATEO.cochera + h.pilas * PRORRATEO.pilas + h.azotea * PRORRATEO.azotea;
+  const ratioIndirecto = (h.precioVenta - h.precioLote) > 0 ? h.costoIndirecto / (h.precioVenta - h.precioLote) : 0;
+  const costoDirectoM2 = areaTotal > 0 ? h.costoDirecto / areaTotal : 0;
+  const costoTotal = h.costoDirecto + h.costoIndirecto + h.postventa + h.precioLote;
+  const utilidad = h.precioVenta - costoTotal;
+  const margenPct = h.precioVenta > 0 ? (utilidad / h.precioVenta) * 100 : 0;
+  return { areaTotal, areaProrrateada, ratioIndirecto, costoDirectoM2, costoTotal, utilidad, margenPct, costoIndirecto: h.costoIndirecto };
+}
+
+const fmtMoney = (v) => new Intl.NumberFormat("es-CR", { maximumFractionDigits: 0 }).format(v || 0);
+const fmtNum = (v, d = 2) => new Intl.NumberFormat("es-CR", { minimumFractionDigits: d, maximumFractionDigits: d }).format(v || 0);
+const fmtPct = (v, d = 1) => `${fmtNum(v, d)}%`;
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+// Evalúa de forma segura expresiones como "2+3.5" o "(10*2)+1.25" escritas en los campos.
+// Solo permite dígitos, + - * / ( ) y puntos decimales; cualquier otro caracter invalida el cálculo.
+function safeEvalMath(expr) {
+  if (typeof expr !== "string") return NaN;
+  const trimmed = expr.trim();
+  if (trimmed === "") return NaN;
+  if (!/^[0-9+\-*/().\s]+$/.test(trimmed)) return NaN;
+  try {
+    const result = Function('"use strict"; return (' + trimmed + ")")();
+    return typeof result === "number" && isFinite(result) ? result : NaN;
+  } catch (e) {
+    return NaN;
+  }
+}
+
+function mapRow(row) {
+  return {
+    id: row.id, casa: row.casa, modelo: row.modelo,
+    tipoPresupuesto: row.tipo_presupuesto || "detallado",
+    cerrada: Number(row.cerrada), ducto: Number(row.ducto), cochera: Number(row.cochera),
+    pilas: Number(row.pilas), azotea: Number(row.azotea), lote: Number(row.lote),
+    costoDirecto: Number(row.costo_directo), costoIndirecto: Number(row.costo_indirecto),
+    postventa: Number(row.postventa), precioVenta: Number(row.precio_venta), precioLote: Number(row.precio_lote),
+  };
+}
+
+/* ============================================================ */
+/*  ESTADO GLOBAL                                                */
+/* ============================================================ */
+const state = {
+  houses: [],
+  loading: true,
+  session: null,
+  activeTab: "formulario",
+  form: { ...emptyForm },
+  errors: {},
+  toast: null,
+  submitting: false,
+  entered: false,
+  historialSearch: "",
+  historialModelo: "Todos",
+  historialTipo: "Todos",
+  dashboardSearch: "",
+  dashboardTipo: "Todos",
+  showComparison: false,
+  deleteTarget: null,   // casa pendiente de borrar
+  deleteStep: 0,        // 0 = sin modal, 1 = primera confirmación, 2 = segunda
+  deleting: false,
+  // Estimador de costo directo
+  baseList: [],
+  estFamilia: "",
+  estCerrada: "",
+  estTercerPiso: "",
+  estCochera: "",
+  estPilas: "",
+  estSelectedBaseId: null,
+  showLogin: false,
+  loginError: "",
+  loginBusy: false,
+};
+
+let costChartInstance = null;
+
+/* ============================================================ */
+/*  CARGA DE DATOS + REALTIME                                    */
+/* ============================================================ */
+async function loadHouses() {
+  const { data, error } = await sb.from("presupuestos").select("*").order("casa", { ascending: true });
+  if (!error) state.houses = (data || []).map(mapRow);
+  state.loading = false;
+  render();
+}
+
+async function loadBase() {
+  const { data, error } = await sb.from("presupuestos_base").select("*").order("modelo", { ascending: true });
+  if (!error) state.baseList = (data || []).map(b => ({
+    id: b.id, modelo: b.modelo, tipo: b.tipo,
+    const_cerrada: Number(b.const_cerrada), pila_terraza: Number(b.pila_terraza),
+    tercer_piso: Number(b.tercer_piso), cochera: Number(b.cochera), azotea: Number(b.azotea),
+    costo_materiales: Number(b.costo_materiales), costo_mano_obra: Number(b.costo_mano_obra),
+    costo_directo: Number(b.costo_directo), costo_indirecto: Number(b.costo_indirecto),
+    precio_venta: Number(b.precio_venta),
+  }));
+  render();
+}
+
+sb.auth.getSession().then(({ data }) => { state.session = data.session; render(); });
+sb.auth.onAuthStateChange((_event, session) => { state.session = session; render(); });
+
+sb.channel("public:presupuestos")
+  .on("postgres_changes", { event: "*", schema: "public", table: "presupuestos" }, () => loadHouses())
+  .subscribe();
+
+loadHouses();
+loadBase();
+
+/* ============================================================ */
+/*  DERIVADOS (equivalentes a los useMemo de la versión React)   */
+/* ============================================================ */
+function getRowsWithStatus() {
+  const rows = state.houses.map(h => ({ ...h, ...calcDerived(h) }));
+  const modelStats = {};
+  rows.forEach(r => {
+    if (!modelStats[r.modelo]) modelStats[r.modelo] = { sum: 0, count: 0 };
+    modelStats[r.modelo].sum += r.ratioIndirecto;
+    modelStats[r.modelo].count += 1;
+  });
+  Object.keys(modelStats).forEach(m => modelStats[m].avg = modelStats[m].sum / modelStats[m].count);
+
+  const globalAvgRatio = rows.length ? rows.reduce((a, r) => a + r.ratioIndirecto, 0) / rows.length : 0;
+
+  const rowsWithStatus = rows.map(r => {
+    const st = modelStats[r.modelo];
+    let status = "neutral";
+    if (st && st.count >= 2) {
+      if (r.ratioIndirecto > st.avg * 1.1) status = "red";
+      else if (r.ratioIndirecto > st.avg) status = "yellow";
+      else status = "green";
+    }
+    return { ...r, status };
+  });
+
+  return { rows, rowsWithStatus, modelStats, globalAvgRatio };
+}
+
+function getModelos() {
+  return Array.from(new Set(state.houses.map(h => h.modelo))).sort();
+}
+
+/* ============================================================ */
+/*  BADGES / COMPONENTES DE TEXTO                                */
+/* ============================================================ */
+function tipoBadge(tipo) {
+  if (tipo === "rapido") {
+    return `<span class="inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium" style="background:rgba(173,208,16,0.18);border-color:var(--orange);color:var(--ink)">Rápido</span>`;
+  }
+  return `<span class="inline-flex items-center gap-1 rounded-full border border-slate-300 bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">Detallado</span>`;
+}
+
+function statusBadge(status) {
+  const map = {
+    red: { label: "Crítico", cls: "bg-red-50 text-red-700 border-red-300" },
+    yellow: { label: "Atención", cls: "bg-amber-50 text-[color:var(--orange)] border-amber-300" },
+    green: { label: "Óptimo", cls: "bg-emerald-50 text-emerald-700 border-emerald-300" },
+    neutral: { label: "Sin ref.", cls: "bg-slate-100 text-slate-500 border-slate-300" },
+  };
+  const { label, cls } = map[status] || map.neutral;
+  return `<span class="inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium ${cls}">${label}</span>`;
+}
+
+function kpiCard(label, value, sub, accentColor) {
+  return `
+    <div class="p-5" style="background:var(--surface);border:1.5px solid var(--stroke);border-radius:15px">
+      <p class="eyebrow diamond" style="color:${accentColor};height:2.4em;line-height:1.2em;overflow:hidden">${esc(label)}</p>
+      <p class="display mt-2" style="font-size:34px;line-height:1;color:var(--ink)">${value}</p>
+      ${sub ? `<p class="mt-2 text-xs" style="color:var(--dim)">${sub}</p>` : ""}
+    </div>`;
+}
+
+/* ============================================================ */
+/*  RENDER: LAYOUT GENERAL                                       */
+/* ============================================================ */
+function render() {
+  if (state.loading) {
+    document.getElementById("app").innerHTML = `<div class="flex h-screen items-center justify-center text-slate-400">Cargando consolidado...</div>`;
+    return;
+  }
+  // Si el usuario aún no ha entrado (y no tiene sesión activa), mostramos la pantalla de bienvenida bloqueante
+  if (!state.entered && !state.session) {
+    document.getElementById("app").innerHTML = renderWelcome();
+    return;
+  }
+  // Las pestañas de edición (estimador, formulario) solo están disponibles con sesión.
+  // Si un invitado tiene seleccionada una de esas, lo mandamos al historial.
+  if (!state.session && (state.activeTab === "formulario" || state.activeTab === "estimador")) {
+    state.activeTab = "historial";
+  }
+  document.getElementById("app").innerHTML = `
+    ${renderHeader()}
+    ${renderNav()}
+    <main class="mx-auto max-w-7xl px-6 py-8">
+      ${state.activeTab === "formulario" ? renderFormulario() : ""}
+      ${state.activeTab === "historial" ? renderHistorial() : ""}
+      ${state.activeTab === "dashboard" ? renderDashboard() : ""}
+      ${state.activeTab === "estimador" ? renderEstimador() : ""}
+    </main>
+    ${state.toast ? `<div class="fixed bottom-6 right-6 rounded-lg bg-slate-900 px-4 py-3 text-sm text-white shadow-lg">${esc(state.toast)}</div>` : ""}
+    ${state.showLogin ? renderLoginModal() : ""}
+    ${renderDeleteModal()}
+  `;
+  if (state.activeTab === "dashboard") requestAnimationFrame(drawCharts);
+}
+
+function renderWelcome() {
+  return `
+  <div class="flex min-h-screen items-center justify-center p-6" style="background:var(--ink);background-image: repeating-linear-gradient(0deg, rgba(255,255,255,0.04) 0px, rgba(255,255,255,0.04) 1px, transparent 1px, transparent 32px), repeating-linear-gradient(90deg, rgba(255,255,255,0.04) 0px, rgba(255,255,255,0.04) 1px, transparent 1px, transparent 32px);">
+    <div class="w-full max-w-md p-8 text-center" style="background:var(--surface);border:2px solid var(--stroke);border-radius:18px">
+      <h1 class="display text-3xl" style="line-height:1.05">Consolidado de <span class="serif-italic" style="color:var(--orange)">presupuestos</span></h1>
+      <p class="eyebrow mt-3">◆ Control de costos</p>
+
+      <button onclick="handleEnter()" class="mt-8 w-full px-5 py-3 text-sm font-semibold transition" style="background:var(--orange);color:var(--orange-ink);border-radius:999px" onmouseover="this.style.background='#96b40e'" onmouseout="this.style.background='var(--orange)'">
+        Entrar
+      </button>
+
+      ${state.showLogin ? `
+        <div class="mt-6 space-y-3 p-4 text-left" style="border:1.5px solid var(--stroke);border-radius:13px;background:var(--bg)">
+          <p class="eyebrow diamond">Acceso administrador</p>
+          <input type="email" id="login-email" placeholder="Correo" class="w-full px-3 py-2 text-sm outline-none" style="border:1.5px solid var(--line);border-radius:10px;background:var(--surface)" />
+          <input type="password" id="login-password" placeholder="Contraseña" class="w-full px-3 py-2 text-sm outline-none" style="border:1.5px solid var(--line);border-radius:10px;background:var(--surface)" />
+          ${state.loginError ? `<p class="text-xs" style="color:var(--orange)">${esc(state.loginError)}</p>` : ""}
+          <div class="flex gap-2">
+            <button onclick="handleLogin()" ${state.loginBusy ? "disabled" : ""} class="flex-1 px-4 py-2 text-sm font-semibold disabled:opacity-60" style="background:var(--orange);color:var(--orange-ink);border-radius:999px">${state.loginBusy ? "Ingresando..." : "Ingresar"}</button>
+            <button onclick="toggleWelcomeLogin()" class="flex-1 px-4 py-2 text-sm font-semibold" style="border:1.5px solid var(--stroke);border-radius:999px;color:var(--ink)">Cancelar</button>
+          </div>
+        </div>
+      ` : `
+        <button onclick="toggleWelcomeLogin()" class="eyebrow mt-6" style="text-decoration:underline;text-decoration-style:dotted;text-underline-offset:4px">Acceso administrador</button>
+      `}
+    </div>
+  </div>`;
+}
+
+function handleEnter() { state.entered = true; state.showLogin = false; state.activeTab = "dashboard"; render(); }
+function toggleWelcomeLogin() { state.showLogin = !state.showLogin; state.loginError = ""; render(); }
+
+function renderHeader() {
+  return `
+  <header class="peak-header relative overflow-hidden px-6 py-8"
+    style="background-image: repeating-linear-gradient(0deg, rgba(255,255,255,0.045) 0px, rgba(255,255,255,0.045) 1px, transparent 1px, transparent 32px), repeating-linear-gradient(90deg, rgba(255,255,255,0.045) 0px, rgba(255,255,255,0.045) 1px, transparent 1px, transparent 32px);">
+    <div class="mx-auto flex max-w-7xl items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <div>
+          <h1 class="display text-3xl tracking-tight" style="line-height:1.05">Consolidado de <span class="serif-italic" style="color:var(--orange)">presupuestos</span></h1>
+          <p class="eyebrow mt-1" style="color:rgba(247,242,232,0.6)">◆ ${state.houses.length} presupuestos cargados</p>
+        </div>
+      </div>
+      <div>
+        ${state.session
+          ? `<div class="flex items-center gap-3 text-sm">
+               <span class="mono hidden text-xs sm:inline" style="color:rgba(247,242,232,0.6)">${esc(state.session.user.email)}</span>
+               <button onclick="handleLogout()" class="font-medium" style="border:1.5px solid var(--surface);color:var(--surface);border-radius:999px;padding:6px 14px">Cerrar sesión</button>
+             </div>`
+          : `<div class="flex items-center gap-3">
+               <span class="eyebrow hidden sm:inline" style="border:1.5px solid rgba(247,242,232,0.4);border-radius:999px;padding:5px 12px;color:rgba(247,242,232,0.7)">👁 Solo lectura</span>
+               <button onclick="openLogin()" class="text-sm font-medium" style="border:1.5px solid var(--surface);color:var(--surface);border-radius:999px;padding:6px 14px">Iniciar sesión</button>
+             </div>`
+        }
+      </div>
+    </div>
+  </header>`;
+}
+
+function renderNav() {
+  const tabs = [];
+  if (state.session) {
+    tabs.push({ id: "estimador", label: "Estimador de Costo" });
+    tabs.push({ id: "formulario", label: "Formulario de Entrada" });
+  }
+  tabs.push({ id: "historial", label: "Historial de Datos" });
+  tabs.push({ id: "dashboard", label: "Panel de Eficiencia y Costos" });
+  return `
+  <nav class="px-6" style="background:var(--surface);border-bottom:1.5px solid var(--stroke)">
+    <div class="mx-auto flex max-w-7xl gap-1">
+      ${tabs.map(t => `
+        <button onclick="setTab('${t.id}')"
+          class="px-4 py-3.5 text-sm font-medium transition"
+          style="${state.activeTab === t.id ? "border-bottom:2px solid var(--orange);color:var(--orange)" : "border-bottom:2px solid transparent;color:var(--dim)"}">
+          ${t.label}
+        </button>
+      `).join("")}
+    </div>
+  </nav>`;
+}
+
+function setTab(id) { state.activeTab = id; render(); }
+
+/* ============================================================ */
+/*  RENDER: FORMULARIO DE ENTRADA                                */
+/* ============================================================ */
+function fieldInput(name, prefix) {
+  const value = esc(state.form[name]);
+  const error = state.errors[name];
+  const evaluated = safeEvalMath(state.form[name]);
+  const isExpression = /[+\-*/()]/.test(state.form[name] || "") && !isNaN(evaluated);
+  const readonly = name === "postventa";
+  return `
+    <div>
+      <label class="mb-1 block text-xs font-medium text-slate-600">${FIELD_LABELS[name]}${readonly ? ' <span class="text-slate-400">(2% del costo directo)</span>' : ""}</label>
+      <div class="relative">
+        ${prefix ? `<span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">${prefix}</span>` : ""}
+        <input type="text" inputmode="decimal" id="field-${name}" value="${value}" ${readonly ? "readonly" : `oninput="handleFormChange('${name}', this.value)"`}
+          class="w-full rounded-lg border ${error ? "border-red-400" : "border-slate-300"} ${readonly ? "bg-slate-100 text-slate-500" : "bg-white text-slate-800"} py-2 text-sm outline-none transition focus:ring-2 focus:ring-slate-200 ${prefix ? "pl-7 pr-3" : "px-3"}" />
+      </div>
+      <p id="field-${name}-result" class="mt-1 text-xs font-medium text-[color:var(--orange)]" style="${isExpression ? "" : "display:none;"}">= ${isExpression ? fmtNum(evaluated) : ""}</p>
+      ${error ? `<p class="mt-1 text-xs text-red-500">${esc(error)}</p>` : ""}
+    </div>`;
+}
+
+function renderFormulario() {
+  if (!state.session) {
+    return `
+      <div class="mx-auto max-w-md rounded-xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+        <p class="mb-4 text-sm text-slate-500">Necesitas iniciar sesión para agregar presupuestos. El Historial y el Dashboard son públicos, pero solo el administrador puede editar datos.</p>
+        <button onclick="openLogin()" class="px-5 py-2.5 text-sm font-semibold" style="background:var(--orange);color:var(--orange-ink);border-radius:999px">Iniciar sesión</button>
+      </div>`;
+  }
+
+  const nums = formToNumbers();
+  const d = calcDerived(nums);
+  const greenPreview = nums._green;
+
+  const modelos = getModelos();
+
+  return `
+  <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
+    <form onsubmit="handleSubmit(event)" class="space-y-6 lg:col-span-2">
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Identificación</h2>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Casa (código)</label>
+            <input type="text" id="field-casa" value="${esc(state.form.casa)}" oninput="handleFormChange('casa', this.value)"
+              class="w-full rounded-lg border ${state.errors.casa ? "border-red-400" : "border-slate-300"} px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            ${state.errors.casa ? `<p class="mt-1 text-xs text-red-500">${esc(state.errors.casa)}</p>` : ""}
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Modelo</label>
+            <input type="text" id="field-modelo" list="modelos-list" value="${esc(state.form.modelo)}" oninput="handleFormChange('modelo', this.value)"
+              class="w-full rounded-lg border ${state.errors.modelo ? "border-red-400" : "border-slate-300"} px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            <datalist id="modelos-list">${modelos.map(m => `<option value="${esc(m)}">`).join("")}</datalist>
+            ${state.errors.modelo ? `<p class="mt-1 text-xs text-red-500">${esc(state.errors.modelo)}</p>` : ""}
+          </div>
+          <div class="sm:col-span-2">
+            <label class="mb-1 block text-xs font-medium text-slate-600">Tipo de presupuesto</label>
+            <div class="inline-flex rounded-lg border border-slate-300 bg-slate-50 p-1">
+              <button type="button" onclick="handleFormChange('tipoPresupuesto', 'detallado')"
+                class="rounded-md px-4 py-1.5 text-sm font-medium transition ${state.form.tipoPresupuesto === "detallado" ? "text-white shadow-sm" : "text-slate-500 hover:text-slate-700"}"
+                style="${state.form.tipoPresupuesto === "detallado" ? "background:#334155" : ""}">Detallado</button>
+              <button type="button" onclick="handleFormChange('tipoPresupuesto', 'rapido')"
+                class="rounded-md px-4 py-1.5 text-sm font-medium transition ${state.form.tipoPresupuesto === "rapido" ? "text-white shadow-sm" : "text-slate-500 hover:text-slate-700"}"
+                style="${state.form.tipoPresupuesto === "rapido" ? "background:var(--orange)" : ""}">Rápido</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Áreas (m²)</h2>
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
+          ${AREA_FIELDS.map(f => fieldInput(f)).join("")}
+        </div>
+      </div>
+
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Datos Financieros</h2>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          ${MONEY_FIELDS.map(f => fieldInput(f, "₡")).join("")}
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Tipo de cambio (₡/$) <span class="text-slate-400">para green</span></label>
+            <div class="relative">
+              <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">₡</span>
+              <input type="text" inputmode="decimal" id="field-tipoCambio" value="${esc(state.form.tipoCambio)}" oninput="handleFormChange('tipoCambio', this.value)"
+                class="w-full rounded-lg border border-slate-300 bg-white py-2 pl-7 pr-3 text-sm text-slate-800 outline-none transition focus:ring-2 focus:ring-slate-200" />
+            </div>
+            <p class="mt-1 text-xs text-slate-400">Green = Área Lote × $${GREEN_USD_M2} × tipo de cambio. Se suma al Costo Indirecto al guardar.</p>
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" ${state.submitting ? "disabled" : ""}
+        class="flex items-center gap-2 px-5 py-2.5 text-sm font-semibold transition disabled:opacity-60" style="background:var(--orange);color:var(--orange-ink);border-radius:999px" onmouseover="this.style.background='#96b40e'" onmouseout="this.style.background='var(--orange)'">
+        ${state.submitting ? "Guardando..." : "+ Agregar Presupuesto"}
+      </button>
+    </form>
+
+    <div class="lg:col-span-1">
+      <div class="sticky top-6 p-6" style="background:var(--chip);border:1.5px solid var(--stroke);border-radius:15px">
+        <h3 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Cálculo Automático</h3>
+        <dl class="mono space-y-3">
+          <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+            <dt class="text-xs text-slate-500">Área Total</dt><dd id="calc-area-total" class="text-lg font-semibold">${fmtNum(d.areaTotal)} m²</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+            <dt class="text-xs text-slate-500">Área Prorrateada</dt><dd id="calc-area-prorrateada" class="text-lg font-semibold">${fmtNum(d.areaProrrateada)} m²</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+            <dt class="text-xs text-slate-500">Costo Indirecto</dt><dd id="calc-indirecto-final" class="text-lg font-semibold">₡${fmtMoney(d.costoIndirecto)}</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+            <dt class="text-xs text-slate-500">% de Indirectos</dt><dd id="calc-ratio" class="text-lg font-semibold">${fmtPct(d.ratioIndirecto * 100)}</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+            <dt class="text-xs text-slate-500">Costo Directo / m²</dt><dd id="calc-costo-m2" class="text-lg font-semibold">₡${fmtNum(d.costoDirectoM2, 0)}</dd>
+          </div>
+          <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+            <dt class="text-xs text-slate-500">Utilidad Estimada</dt><dd id="calc-utilidad" class="text-lg font-semibold ${d.utilidad < 0 ? "text-red-600" : "text-emerald-600"}">₡${fmtMoney(d.utilidad)}</dd>
+          </div>
+          <div class="flex items-center justify-between">
+            <dt class="text-xs text-slate-500">Margen</dt><dd id="calc-margen" class="text-lg font-semibold ${d.margenPct < 0 ? "text-red-600" : "text-emerald-600"}">${fmtPct(d.margenPct)}</dd>
+          </div>
+        </dl>
+        <p class="mt-5 text-xs leading-relaxed text-slate-500">Área Prorrateada = Cerrada + Ducto + 0.5×Cochera + 0.5×Pilas/Terraza + 0.35×Azotea</p>
+      </div>
+    </div>
+  </div>`;
+}
+
+function handleFormChange(name, value) {
+  state.form[name] = value;
+
+  // El switch de tipo de presupuesto necesita re-render para verse activo
+  if (name === "tipoPresupuesto") { render(); return; }
+
+  // Postventa se autocalcula como 2% del costo directo
+  if (name === "costoDirecto") {
+    const cd = safeEvalMath(value);
+    state.form.postventa = isNaN(cd) ? "" : String(Math.round(cd * 0.02));
+    const pvEl = document.getElementById("field-postventa");
+    if (pvEl) pvEl.value = state.form.postventa;
+  }
+
+  // Si el campo es de área o financiero, muestra el resultado calculado debajo (ej. "2+3.5" -> "= 5.50")
+  const resultEl = document.getElementById(`field-${name}-result`);
+  if (resultEl) {
+    const evaluated = safeEvalMath(value);
+    const isExpression = /[+\-*/()]/.test(value || "") && !isNaN(evaluated);
+    resultEl.style.display = isExpression ? "" : "none";
+    resultEl.textContent = isExpression ? "= " + fmtNum(evaluated) : "";
+  }
+
+  // Actualiza solo el panel de cálculo, sin re-renderizar todo (evita perder el foco al escribir)
+  const nums = formToNumbers();
+  const d = calcDerived(nums);
+  document.getElementById("calc-area-total").textContent = fmtNum(d.areaTotal) + " m²";
+  document.getElementById("calc-area-prorrateada").textContent = fmtNum(d.areaProrrateada) + " m²";
+  const indFinalEl = document.getElementById("calc-indirecto-final");
+  if (indFinalEl) indFinalEl.textContent = "₡" + fmtMoney(d.costoIndirecto);
+  document.getElementById("calc-ratio").textContent = fmtPct(d.ratioIndirecto * 100);
+  document.getElementById("calc-costo-m2").textContent = "₡" + fmtNum(d.costoDirectoM2, 0);
+  const util = document.getElementById("calc-utilidad");
+  util.textContent = "₡" + fmtMoney(d.utilidad);
+  util.className = "text-lg font-semibold " + (d.utilidad < 0 ? "text-red-600" : "text-emerald-600");
+  const margen = document.getElementById("calc-margen");
+  margen.textContent = fmtPct(d.margenPct);
+  margen.className = "text-lg font-semibold " + (d.margenPct < 0 ? "text-red-600" : "text-emerald-600");
+}
+
+function validateForm() {
+  const errs = {};
+  if (!state.form.casa.trim()) errs.casa = "El código de casa es obligatorio.";
+  else if (state.houses.some(h => h.casa.toLowerCase() === state.form.casa.trim().toLowerCase())) errs.casa = "Ya existe una casa con este código.";
+  if (!state.form.modelo.trim()) errs.modelo = "El modelo es obligatorio.";
+
+  [...AREA_FIELDS, ...MONEY_FIELDS].forEach(k => {
+    const raw = state.form[k];
+    if (raw === "" || raw === null) { errs[k] = "Requerido."; return; }
+    const v = safeEvalMath(raw);
+    if (isNaN(v) || v < 0) errs[k] = "Debe ser un número (o una operación como 2+3) ≥ 0.";
+  });
+  if (safeEvalMath(state.form.precioVenta) <= 0) errs.precioVenta = "El precio de venta debe ser mayor a 0.";
+  if (safeEvalMath(state.form.costoDirecto) <= 0) errs.costoDirecto = "El costo directo debe ser mayor a 0.";
+
+  state.errors = errs;
+  return Object.keys(errs).length === 0;
+}
+
+async function handleSubmit(e) {
+  e.preventDefault();
+  if (!validateForm()) { render(); return; }
+  state.submitting = true; render();
+
+  const nums = formToNumbers();
+  const row = {
+    casa: state.form.casa.trim(), modelo: state.form.modelo.trim(),
+    tipo_presupuesto: state.form.tipoPresupuesto || "detallado",
+    cerrada: nums.cerrada, ducto: nums.ducto,
+    cochera: nums.cochera, pilas: nums.pilas,
+    azotea: nums.azotea, lote: nums.lote,
+    costo_directo: nums.costoDirecto, costo_indirecto: nums.costoIndirecto,
+    postventa: nums.postventa, precio_venta: nums.precioVenta,
+    precio_lote: nums.precioLote,
+  };
+
+  const { error } = await sb.from("presupuestos").insert(row);
+  state.submitting = false;
+
+  if (error) {
+    state.errors = { casa: "Error al guardar: " + error.message };
+    render();
+    return;
+  }
+
+  state.form = { ...emptyForm };
+  state.errors = {};
+  state.toast = `Presupuesto para "${row.casa}" agregado correctamente.`;
+  await loadHouses();
+  setTimeout(() => { state.toast = null; render(); }, 3500);
+}
+
+/* ============================================================ */
+/*  RENDER: HISTORIAL DE DATOS                                   */
+/* ============================================================ */
+function renderHistorial() {
+  const modelos = getModelos();
+  const casasFiltradas = state.houses.filter(h => state.historialTipo === "Todos" || (h.tipoPresupuesto || "detallado") === state.historialTipo);
+  return `
+  <div>
+    <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div class="relative w-full sm:w-72">
+        <input type="text" id="historial-search" list="historial-casas-list" value="${esc(state.historialSearch)}" oninput="handleHistorialSearch(this.value)"
+          placeholder="Buscar o seleccionar casa..."
+          class="w-full rounded-lg border border-slate-300 py-2 pl-3 pr-3 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200" />
+        <datalist id="historial-casas-list">
+          ${casasFiltradas.map(h => `<option value="${esc(h.casa)}">${esc(h.casa)} — ${esc(h.modelo)}</option>`).join("")}
+        </datalist>
+      </div>
+      <div class="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
+        <select onchange="handleHistorialTipo(this.value)" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200 sm:w-44">
+          <option ${state.historialTipo === "Todos" ? "selected" : ""}>Todos</option>
+          <option value="detallado" ${state.historialTipo === "detallado" ? "selected" : ""}>Solo Detallados</option>
+          <option value="rapido" ${state.historialTipo === "rapido" ? "selected" : ""}>Solo Rápidos</option>
+        </select>
+        <select onchange="handleHistorialModelo(this.value)" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200 sm:w-56">
+          <option ${state.historialModelo === "Todos" ? "selected" : ""}>Todos</option>
+          ${modelos.map(m => `<option ${state.historialModelo === m ? "selected" : ""}>${esc(m)}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+    <div id="historial-table-container">${renderHistorialTable()}</div>
+  </div>`;
+}
+
+function renderHistorialTable() {
+  const { rowsWithStatus } = getRowsWithStatus();
+  const ordenTipo = { detallado: 0, rapido: 1 };
+  const filtered = rowsWithStatus.filter(r => {
+    const matchTipo = state.historialTipo === "Todos" || r.tipoPresupuesto === state.historialTipo;
+    const matchModelo = state.historialModelo === "Todos" || r.modelo === state.historialModelo;
+    const matchSearch = r.casa.toLowerCase().includes(state.historialSearch.toLowerCase());
+    return matchTipo && matchModelo && matchSearch;
+  }).sort((a, b) => {
+    const t = (ordenTipo[a.tipoPresupuesto] ?? 0) - (ordenTipo[b.tipoPresupuesto] ?? 0);
+    if (t !== 0) return t;
+    const m = a.modelo.localeCompare(b.modelo, "es");
+    if (m !== 0) return m;
+    return b.cerrada - a.cerrada;
+  });
+
+  return `
+  <div class="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+    <table class="w-full min-w-[1550px] text-left text-sm">
+      <thead>
+        <tr class="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+          <th class="px-4 py-3 font-semibold">Casa</th><th class="px-4 py-3 font-semibold">Modelo</th>
+          <th class="px-4 py-3 font-semibold">Tipo</th>
+          <th class="px-4 py-3 text-right font-semibold">Área Cerrada</th><th class="px-4 py-3 text-right font-semibold">Cochera+Pila/Terr.</th><th class="px-4 py-3 text-right font-semibold">Azotea</th><th class="px-4 py-3 text-right font-semibold">Ducto</th><th class="px-4 py-3 text-right font-semibold">Área Total</th><th class="px-4 py-3 text-right font-semibold">Área Prorr.</th>
+          <th class="px-4 py-3 text-right font-semibold">Costo Directo</th><th class="px-4 py-3 text-right font-semibold">Costo Indirecto</th>
+          <th class="px-4 py-3 text-right font-semibold">% Indirectos</th><th class="px-4 py-3 text-right font-semibold">Precio Lote</th><th class="px-4 py-3 text-right font-semibold">Precio Venta</th>
+          <th class="px-4 py-3 text-right font-semibold">Margen</th><th class="px-4 py-3 font-semibold">Estado</th>
+          ${state.session ? '<th class="px-4 py-3 font-semibold"></th>' : ""}
+        </tr>
+      </thead>
+      <tbody class="mono">
+        ${filtered.map(r => `
+          <tr class="border-b border-slate-100 last:border-0 hover:bg-slate-50">
+            <td class="px-4 py-2.5 font-semibold text-slate-800">${esc(r.casa)}</td>
+            <td class="px-4 py-2.5 text-slate-600" style="font-family:'Roboto',sans-serif;">${esc(r.modelo)}</td>
+            <td class="px-4 py-2.5" style="font-family:'Roboto',sans-serif;">${tipoBadge(r.tipoPresupuesto)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.cerrada)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.cochera + r.pilas)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.azotea)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.ducto)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.areaTotal)}</td>
+            <td class="px-4 py-2.5 text-right">${fmtNum(r.areaProrrateada)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.costoDirecto)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.costoIndirecto)}</td>
+            <td class="px-4 py-2.5 text-right font-semibold">${fmtPct(r.ratioIndirecto * 100)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.precioLote)}</td>
+            <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.precioVenta)}</td>
+            <td class="px-4 py-2.5 text-right font-semibold ${r.margenPct < 0 ? "text-red-600" : "text-emerald-600"}">${fmtPct(r.margenPct)}</td>
+            <td class="px-4 py-2.5">${statusBadge(r.status)}</td>
+            ${state.session ? `<td class="px-4 py-2.5 text-right"><button onclick="pedirBorrado('${esc(r.casa).replace(/'/g, "\\'")}')" class="rounded-md border border-red-200 px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50" title="Borrar presupuesto">Borrar</button></td>` : ""}
+          </tr>`).join("")}
+        ${filtered.length === 0 ? `<tr><td colspan="${state.session ? 17 : 16}" class="px-4 py-8 text-center text-slate-400" style="font-family:'Roboto',sans-serif;">No hay presupuestos que coincidan con la búsqueda.</td></tr>` : ""}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+function handleHistorialSearch(value) {
+  state.historialSearch = value;
+  document.getElementById("historial-table-container").innerHTML = renderHistorialTable();
+}
+function handleHistorialModelo(value) {
+  state.historialModelo = value;
+  document.getElementById("historial-table-container").innerHTML = renderHistorialTable();
+}
+function handleHistorialTipo(value) {
+  state.historialTipo = value;
+  render();
+}
+
+/* ============================================================ */
+/*  RENDER: PANEL DE EFICIENCIA Y COSTOS                         */
+/* ============================================================ */
+function getModelStatus(ratioDecimal, globalAvgRatio) {
+  if (!globalAvgRatio) return "neutral";
+  if (ratioDecimal > globalAvgRatio * 1.1) return "red";
+  if (ratioDecimal > globalAvgRatio) return "yellow";
+  return "green";
+}
+
+function getModelChartData() {
+  const { rowsWithStatus, globalAvgRatio } = getRowsWithStatus();
+  const grouped = {};
+  rowsWithStatus
+    .filter(r => state.dashboardTipo === "Todos" || r.tipoPresupuesto === state.dashboardTipo)
+    .forEach(r => {
+    const key = r.modelo + "||" + r.tipoPresupuesto;
+    if (!grouped[key]) grouped[key] = { modelo: r.modelo, tipo: r.tipoPresupuesto, count: 0, directoSum: 0, indirectoSum: 0, utilidadSum: 0, ratioSum: 0 };
+    const g = grouped[key];
+    g.count++; g.directoSum += r.costoDirecto; g.indirectoSum += r.costoIndirecto; g.utilidadSum += r.utilidad; g.ratioSum += r.ratioIndirecto;
+  });
+  const modelChartData = Object.values(grouped).map(g => {
+    const ratioAvg = g.ratioSum / g.count;
+    const suf = g.tipo === "rapido" ? " (R)" : " (D)";
+    return {
+      modelo: g.modelo, tipo: g.tipo, count: g.count,
+      etiqueta: g.modelo + suf,
+      DirectoProm: Math.round(g.directoSum / g.count), IndirectoProm: Math.round(g.indirectoSum / g.count),
+      UtilidadProm: Math.round(g.utilidadSum / g.count), ratioPct: ratioAvg * 100,
+      status: getModelStatus(ratioAvg, globalAvgRatio),
+    };
+  });
+  // Ordenar por modelo y, dentro del modelo, Detallado antes que Rápido
+  const costChartData = [...modelChartData].sort((a, b) =>
+    b.DirectoProm - a.DirectoProm
+  );
+  return { modelChartData, costChartData, globalAvgRatio };
+}
+
+function getModelAverages(rows) {
+  const grouped = {};
+  rows.forEach(r => {
+    if (!grouped[r.modelo]) grouped[r.modelo] = { count: 0, costoDirectoSum: 0, costoIndirectoSum: 0, utilidadSum: 0 };
+    grouped[r.modelo].count++;
+    grouped[r.modelo].costoDirectoSum += r.costoDirecto;
+    grouped[r.modelo].costoIndirectoSum += r.costoIndirecto;
+    grouped[r.modelo].utilidadSum += r.utilidad;
+  });
+  const result = {};
+  Object.entries(grouped).forEach(([modelo, g]) => {
+    result[modelo] = {
+      avgCostoDirecto: g.costoDirectoSum / g.count,
+      avgCostoIndirecto: g.costoIndirectoSum / g.count,
+      avgUtilidad: g.utilidadSum / g.count,
+    };
+  });
+  return result;
+}
+
+function renderDashboard() {
+  return `
+  <div class="space-y-6">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div>
+        <h2 class="text-sm font-semibold text-slate-700">Indicadores de Eficiencia</h2>
+        <p class="text-xs text-slate-400">Busca una casa para ver sus indicadores; los gráficos por modelo siempre muestran todo el consolidado</p>
+      </div>
+      <div class="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
+        <select onchange="handleDashboardTipo(this.value)" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200 sm:w-44">
+          <option ${state.dashboardTipo === "Todos" ? "selected" : ""}>Todos</option>
+          <option value="detallado" ${state.dashboardTipo === "detallado" ? "selected" : ""}>Solo Detallados</option>
+          <option value="rapido" ${state.dashboardTipo === "rapido" ? "selected" : ""}>Solo Rápidos</option>
+        </select>
+        <div class="relative w-full sm:w-72">
+          <input type="text" id="dashboard-search" list="dashboard-casas-list" value="${esc(state.dashboardSearch)}" oninput="handleDashboardSearch(this.value)"
+            placeholder="Buscar o seleccionar casa..."
+            class="w-full rounded-lg border border-slate-300 py-2 pl-3 pr-3 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200" />
+          <datalist id="dashboard-casas-list">
+            ${state.houses.filter(h => state.dashboardTipo === "Todos" || (h.tipoPresupuesto || "detallado") === state.dashboardTipo).map(h => `<option value="${esc(h.casa)}">${esc(h.casa)} — ${esc(h.modelo)}</option>`).join("")}
+          </datalist>
+        </div>
+      </div>
+    </div>
+
+    <div id="dashboard-kpis">${renderDashboardKpis()}</div>
+
+    <div id="dashboard-comparison">${renderComparison()}</div>
+
+    <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h3 class="mb-1 text-sm font-semibold text-slate-700">Composición Promedio de Costos por Modelo</h3>
+      <p class="mb-4 text-xs text-slate-400">Costo Directo, Costo Indirecto y Utilidad promedio por casa (₡). Cada modelo se separa en (D) Detallado y (R) Rápido. Todos los modelos, sin filtrar.</p>
+      <div style="height:320px;"><canvas id="chart-cost"></canvas></div>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h3 class="mb-4 text-sm font-semibold text-slate-700">% de Indirectos Promedio por Modelo</h3>
+        <div class="space-y-2">${renderModelRatioList()}</div>
+      </div>
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h3 class="mb-4 text-sm font-semibold text-slate-700">Presupuestos que Requieren Revisión</h3>
+        <div id="dashboard-alerts">${renderDashboardAlerts()}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderDashboardKpis() {
+  const { rowsWithStatus, rows } = getRowsWithStatus();
+  const dashboardRows = rowsWithStatus
+    .filter(r => state.dashboardTipo === "Todos" || r.tipoPresupuesto === state.dashboardTipo)
+    .filter(r => r.casa.toLowerCase().includes(state.dashboardSearch.toLowerCase()));
+
+  const kpiAvgRatio = dashboardRows.length ? dashboardRows.reduce((a, r) => a + r.ratioIndirecto, 0) / dashboardRows.length : 0;
+  const kpiAvgMargen = dashboardRows.length ? dashboardRows.reduce((a, r) => a + r.margenPct, 0) / dashboardRows.length : 0;
+
+  const modelAverages = getModelAverages(rows);
+  // Promedios sobre las filas ya filtradas (respeta el filtro de tipo Detallado/Rápido)
+  const avgSet = dashboardRows.length ? dashboardRows : rows;
+  const globalAvgCostoDirecto = avgSet.length ? avgSet.reduce((a, r) => a + r.costoDirecto, 0) / avgSet.length : 0;
+  const globalAvgCostoIndirecto = avgSet.length ? avgSet.reduce((a, r) => a + r.costoIndirecto, 0) / avgSet.length : 0;
+  const globalAvgUtilidad = avgSet.length ? avgSet.reduce((a, r) => a + r.utilidad, 0) / avgSet.length : 0;
+
+  const comparisonRow = state.dashboardSearch.trim() && dashboardRows.length === 1 ? dashboardRows[0] : null;
+
+  let costoComp = { value: globalAvgCostoDirecto, delta: null };
+  let indirectoComp = { value: globalAvgCostoIndirecto, delta: null };
+  let utilComp = { value: globalAvgUtilidad, delta: null };
+  if (comparisonRow) {
+    const mAvgC = modelAverages[comparisonRow.modelo]?.avgCostoDirecto ?? 0;
+    const deltaC = comparisonRow.costoDirecto - mAvgC;
+    costoComp = { value: mAvgC, delta: deltaC, deltaPct: mAvgC > 0 ? (deltaC / mAvgC) * 100 : 0, modelo: comparisonRow.modelo, own: comparisonRow.costoDirecto };
+
+    const mAvgI = modelAverages[comparisonRow.modelo]?.avgCostoIndirecto ?? 0;
+    const deltaI = comparisonRow.costoIndirecto - mAvgI;
+    indirectoComp = { value: mAvgI, delta: deltaI, deltaPct: mAvgI > 0 ? (deltaI / mAvgI) * 100 : 0, modelo: comparisonRow.modelo, own: comparisonRow.costoIndirecto };
+
+    const mAvgU = modelAverages[comparisonRow.modelo]?.avgUtilidad ?? 0;
+    const deltaU = comparisonRow.utilidad - mAvgU;
+    utilComp = { value: mAvgU, delta: deltaU, deltaPct: mAvgU !== 0 ? (deltaU / Math.abs(mAvgU)) * 100 : 0, modelo: comparisonRow.modelo, own: comparisonRow.utilidad };
+  }
+
+  const costoSub = costoComp.delta === null
+    ? ""
+    : `${esc(costoComp.modelo)} · tu casa: ₡${fmtMoney(costoComp.own)} <span class="font-semibold ${costoComp.delta > 0 ? "text-red-600" : "text-emerald-600"}">(${costoComp.delta > 0 ? "+" : ""}${fmtNum(costoComp.deltaPct, 1)}%)</span>`;
+
+  const indirectoSub = indirectoComp.delta === null
+    ? ""
+    : `${esc(indirectoComp.modelo)} · tu casa: ₡${fmtMoney(indirectoComp.own)} <span class="font-semibold ${indirectoComp.delta > 0 ? "text-red-600" : "text-emerald-600"}">(${indirectoComp.delta > 0 ? "+" : ""}${fmtNum(indirectoComp.deltaPct, 1)}%)</span>`;
+
+  const utilSub = utilComp.delta === null
+    ? ""
+    : `${esc(utilComp.modelo)} · tu casa: ₡${fmtMoney(utilComp.own)} <span class="font-semibold ${utilComp.delta >= 0 ? "text-emerald-600" : "text-red-600"}">(${utilComp.delta >= 0 ? "+" : ""}${fmtNum(utilComp.deltaPct, 1)}%)</span>`;
+
+  return `
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
+      ${kpiCard("Costo Directo Promedio", "₡" + fmtMoney(costoComp.value), costoSub, "#1c1813")}
+      ${kpiCard("% de Indirectos", fmtPct(kpiAvgRatio * 100), "", "#1c1813")}
+      ${kpiCard("Costo Indirecto Promedio", "₡" + fmtMoney(indirectoComp.value), indirectoSub, "#1c1813")}
+      ${kpiCard("Utilidad %", fmtPct(kpiAvgMargen), "", "#1c1813")}
+      ${kpiCard("Utilidad vs Promedio del Modelo", "₡" + fmtMoney(utilComp.value), utilSub, "#1c1813")}
+    </div>`;
+}
+
+function renderDashboardAlerts() {
+  const { rowsWithStatus, modelStats } = getRowsWithStatus();
+  const alerts = rowsWithStatus
+    .filter(r => r.status === "red" || r.status === "yellow")
+    .filter(r => state.dashboardTipo === "Todos" || r.tipoPresupuesto === state.dashboardTipo)
+    .filter(r => r.casa.toLowerCase().includes(state.dashboardSearch.toLowerCase()))
+    .sort((a, b) => b.ratioIndirecto - a.ratioIndirecto);
+
+  if (alerts.length === 0) return `<p class="text-sm text-slate-400">No hay presupuestos fuera de rango por el momento.</p>`;
+
+  return `<div class="space-y-2">${alerts.map(r => {
+    const avg = modelStats[r.modelo]?.avg ?? 0;
+    const delta = avg > 0 ? ((r.ratioIndirecto - avg) / avg) * 100 : 0;
+    return `
+      <div class="flex items-center justify-between rounded-lg border px-3 py-2 text-sm ${r.status === "red" ? "border-red-200 bg-red-50" : "border-amber-200 bg-amber-50"}">
+        <div>
+          <p class="font-medium text-slate-800">${esc(r.casa)} <span class="text-slate-400">· ${esc(r.modelo)}</span></p>
+          <p class="text-xs text-slate-500">% Indirectos ${fmtPct(r.ratioIndirecto * 100)} — ${delta >= 0 ? "+" : ""}${fmtNum(delta, 1)}% vs. promedio del modelo</p>
+        </div>
+        ${statusBadge(r.status)}
+      </div>`;
+  }).join("")}</div>`;
+}
+
+function renderModelRatioList() {
+  const { rowsWithStatus } = getRowsWithStatus();
+  const filtradas = rowsWithStatus.filter(r => state.dashboardTipo === "Todos" || r.tipoPresupuesto === state.dashboardTipo);
+  const stats = {};
+  filtradas.forEach(r => {
+    if (!stats[r.modelo]) stats[r.modelo] = { sum: 0, count: 0 };
+    stats[r.modelo].sum += r.ratioIndirecto;
+    stats[r.modelo].count += 1;
+  });
+  Object.keys(stats).forEach(m => stats[m].avg = stats[m].sum / stats[m].count);
+  const entries = Object.entries(stats).sort((a, b) => b[1].avg - a[1].avg);
+  if (entries.length === 0) return `<p class="text-sm text-slate-400">No hay datos para este filtro.</p>`;
+  return entries.map(([modelo, s]) => `
+    <div class="flex items-center justify-between rounded-lg border border-slate-100 px-3 py-2 text-sm">
+      <div><p class="font-medium text-slate-700">${esc(modelo)}</p><p class="text-xs text-slate-400">${s.count} presupuesto${s.count !== 1 ? "s" : ""}</p></div>
+      <span class="mono font-semibold text-slate-800">${fmtPct(s.avg * 100)}</span>
+    </div>`).join("");
+}
+
+function renderComparison() {
+  const { rowsWithStatus, modelStats } = getRowsWithStatus();
+  const term = state.dashboardSearch.trim().toLowerCase();
+  if (!term) return "";
+
+  // Buscamos la casa seleccionada (coincidencia exacta, o única coincidencia parcial)
+  let selected = rowsWithStatus.find(r => r.casa.toLowerCase() === term);
+  if (!selected) {
+    const matches = rowsWithStatus.filter(r => r.casa.toLowerCase().includes(term));
+    if (matches.length === 1) selected = matches[0];
+  }
+  if (!selected) return "";
+
+  // Ordenar: primero todos los detallados, luego todos los rápidos.
+  // Dentro de cada grupo, de mayor a menor por área cerrada.
+  const ordenTipo = { detallado: 0, rapido: 1 };
+  const sameModel = rowsWithStatus
+    .filter(r => r.modelo === selected.modelo)
+    .filter(r => state.dashboardTipo === "Todos" || r.tipoPresupuesto === state.dashboardTipo)
+    .sort((a, b) => {
+      const t = (ordenTipo[a.tipoPresupuesto] ?? 0) - (ordenTipo[b.tipoPresupuesto] ?? 0);
+      if (t !== 0) return t;
+      return b.cerrada - a.cerrada;
+    });
+  const avg = modelStats[selected.modelo]?.avg ?? 0;
+
+  return `
+  <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+    <div class="mb-1 flex items-center gap-2">
+      <h3 class="text-sm font-semibold text-slate-700">Comparación por modelo</h3>
+      <span class="rounded-full px-2 py-0.5 text-xs font-medium" style="background:var(--orange);color:var(--orange-ink)">${esc(selected.modelo)}</span>
+    </div>
+    <p class="mb-4 text-xs text-slate-400">Todas las casas del modelo de <span class="font-semibold">${esc(selected.casa)}</span> (${sameModel.length} casa${sameModel.length !== 1 ? "s" : ""}), agrupadas por tipo y ordenadas por área cerrada. La fila resaltada es la seleccionada.</p>
+    <div class="overflow-x-auto">
+      <table class="w-full min-w-[1120px] text-left text-sm">
+        <thead>
+          <tr class="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+            <th class="px-4 py-3 font-semibold">Casa</th>
+            <th class="px-4 py-3 font-semibold">Tipo</th>
+            <th class="px-4 py-3 text-right font-semibold">Área Cerrada</th>
+            <th class="px-4 py-3 text-right font-semibold">Costo Directo</th>
+            <th class="px-4 py-3 text-right font-semibold">Costo Indirecto</th>
+            <th class="px-4 py-3 text-right font-semibold">% Indirectos</th>
+            <th class="px-4 py-3 text-right font-semibold">Precio Venta</th>
+            <th class="px-4 py-3 text-right font-semibold">Utilidad</th>
+            <th class="px-4 py-3 text-right font-semibold">Margen</th>
+          </tr>
+        </thead>
+        <tbody class="mono">
+          ${sameModel.map(r => {
+            const isSel = r.casa === selected.casa;
+            return `
+            <tr class="border-b border-slate-100 last:border-0 ${isSel ? "font-semibold" : "hover:bg-slate-50"}" ${isSel ? 'style="background:rgba(173,208,16,0.18)"' : ""}>
+              <td class="px-4 py-2.5 text-slate-800">${esc(r.casa)}${isSel ? ' <span class="text-xs" style="color:var(--orange)">◄</span>' : ""}</td>
+              <td class="px-4 py-2.5" style="font-family:'Roboto',sans-serif;">${tipoBadge(r.tipoPresupuesto)}</td>
+              <td class="px-4 py-2.5 text-right">${fmtNum(r.cerrada)} m²</td>
+              <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.costoDirecto)}</td>
+              <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.costoIndirecto)}</td>
+              <td class="px-4 py-2.5 text-right">${fmtPct(r.ratioIndirecto * 100)}</td>
+              <td class="px-4 py-2.5 text-right">₡${fmtMoney(r.precioVenta)}</td>
+              <td class="px-4 py-2.5 text-right ${r.utilidad < 0 ? "text-red-600" : "text-emerald-600"}">₡${fmtMoney(r.utilidad)}</td>
+              <td class="px-4 py-2.5 text-right ${r.margenPct < 0 ? "text-red-600" : "text-emerald-600"}">${fmtPct(r.margenPct)}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+        <tfoot>
+          <tr class="border-t-2 border-slate-300 bg-slate-50 text-xs text-slate-600">
+            <td class="px-4 py-2.5 font-semibold uppercase">Promedio del modelo</td>
+            <td class="px-4 py-2.5"></td>
+            <td class="px-4 py-2.5 text-right mono">${fmtNum(sameModel.reduce((a, r) => a + r.cerrada, 0) / sameModel.length)} m²</td>
+            <td class="px-4 py-2.5 text-right mono">₡${fmtMoney(sameModel.reduce((a, r) => a + r.costoDirecto, 0) / sameModel.length)}</td>
+            <td class="px-4 py-2.5 text-right mono">₡${fmtMoney(sameModel.reduce((a, r) => a + r.costoIndirecto, 0) / sameModel.length)}</td>
+            <td class="px-4 py-2.5 text-right mono">${fmtPct(avg * 100)}</td>
+            <td class="px-4 py-2.5 text-right mono">₡${fmtMoney(sameModel.reduce((a, r) => a + r.precioVenta, 0) / sameModel.length)}</td>
+            <td class="px-4 py-2.5 text-right mono">₡${fmtMoney(sameModel.reduce((a, r) => a + r.utilidad, 0) / sameModel.length)}</td>
+            <td class="px-4 py-2.5 text-right mono">${fmtPct(sameModel.reduce((a, r) => a + r.margenPct, 0) / sameModel.length)}</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>`;
+}
+
+function handleDashboardTipo(value) {
+  state.dashboardTipo = value;
+  render();
+}
+
+function handleDashboardSearch(value) {
+  state.dashboardSearch = value;
+  document.getElementById("dashboard-kpis").innerHTML = renderDashboardKpis();
+  document.getElementById("dashboard-alerts").innerHTML = renderDashboardAlerts();
+  const comp = document.getElementById("dashboard-comparison");
+  if (comp) comp.innerHTML = renderComparison();
+}
+
+/* ============================================================ */
+/*  GRÁFICOS (Chart.js) — siempre con TODOS los modelos          */
+/* ============================================================ */
+function drawCharts() {
+  const { costChartData } = getModelChartData();
+
+  const costCtx = document.getElementById("chart-cost");
+  if (costChartInstance) costChartInstance.destroy();
+  if (costCtx) {
+    costChartInstance = new Chart(costCtx, {
+      type: "bar",
+      data: {
+        labels: costChartData.map(d => d.etiqueta),
+        datasets: [
+          { label: "Costo Directo Prom.", data: costChartData.map(d => d.DirectoProm), backgroundColor: "#1c1813", stack: "a" },
+          { label: "Costo Indirecto Prom.", data: costChartData.map(d => d.IndirectoProm), backgroundColor: "#ADD010", stack: "a" },
+          { label: "Utilidad Prom.", data: costChartData.map(d => d.UtilidadProm), backgroundColor: "#6b7a45", stack: "a" },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { stacked: true, ticks: { font: { size: 11 } } },
+          y: { stacked: true, ticks: { callback: v => (v / 1e6).toFixed(0) + "M", font: { size: 11 } } },
+        },
+        plugins: { tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ₡${fmtMoney(ctx.raw)}` } } },
+      },
+    });
+  }
+}
+
+/* ============================================================ */
+/*  ESTIMADOR DE COSTO DIRECTO                                   */
+/* ============================================================ */
+
+// Familias base únicas (nombre de modelo) para el selector
+function getBaseFamilias() {
+  return Array.from(new Set(state.baseList.map(b => b.modelo))).sort((a, b) => a.localeCompare(b, "es"));
+}
+
+// Dado la familia elegida, devuelve las bases de esa familia
+// ordenadas de mayor a menor por área cerrada.
+function getBaseSugerencias() {
+  if (!state.estFamilia) return [];
+  const candidatos = state.baseList.filter(b => b.modelo === state.estFamilia);
+  return [...candidatos].sort((a, b) => b.const_cerrada - a.const_cerrada);
+}
+
+// Calcula el costo directo estimado a partir de una base seleccionada y las áreas objetivo.
+// El tercer piso (oficina) se suma al área cerrada para efectos del ajuste de ₡310,000/m².
+function calcEstimacion(base) {
+  const cerradaObj = (safeEvalMath(state.estCerrada) || 0) + (safeEvalMath(state.estTercerPiso) || 0);
+  const cocheraObj = safeEvalMath(state.estCochera) || 0;
+  const pilasObj = safeEvalMath(state.estPilas) || 0;
+
+  const cerradaBase = base.const_cerrada + base.tercer_piso;
+  const difCerrada = cerradaObj - cerradaBase;
+  const extObj = cocheraObj + pilasObj;
+  const extBase = base.cochera + base.pila_terraza;
+  const difExterior = extObj - extBase;
+
+  const ajusteCerrada = difCerrada * AJUSTE_CERRADA;
+  const ajusteExterior = difExterior * AJUSTE_EXTERIOR;
+  const costoDirectoEstimado = base.costo_directo + ajusteCerrada + ajusteExterior;
+
+  return { difCerrada, difExterior, extObj, extBase, cerradaObj, cerradaBase, ajusteCerrada, ajusteExterior, costoDirectoEstimado };
+}
+
+function renderEstimador() {
+  const familias = getBaseFamilias();
+  const sugerencias = getBaseSugerencias();
+  const selected = state.estSelectedBaseId ? state.baseList.find(b => b.id === state.estSelectedBaseId) : null;
+
+  return `
+  <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
+    <!-- Columna izquierda: entradas y sugerencias -->
+    <div class="space-y-6 lg:col-span-2">
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-1 text-sm font-semibold uppercase tracking-wide text-slate-500">Datos de tu casa objetivo</h2>
+        <p class="mb-4 text-xs text-slate-400">Elige la familia del modelo e ingresa las áreas; la app buscará el presupuesto base más parecido.</p>
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Familia del modelo</label>
+            <select id="est-familia" onchange="handleEstFamilia(this.value)" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200">
+              <option value="">-- Seleccionar --</option>
+              ${familias.map(f => `<option ${state.estFamilia === f ? "selected" : ""}>${esc(f)}</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Área Cerrada objetivo (m²)</label>
+            <input type="text" inputmode="decimal" id="est-cerrada" value="${esc(state.estCerrada)}" oninput="handleEstInput('estCerrada', this.value)"
+              class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            <p id="est-cerrada-result" class="mt-1 text-xs font-medium text-[color:var(--orange)]" style="display:none;"></p>
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Tercer Piso / Oficina objetivo (m²)</label>
+            <input type="text" inputmode="decimal" id="est-tercerpiso" value="${esc(state.estTercerPiso)}" oninput="handleEstInput('estTercerPiso', this.value)"
+              class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            <p id="est-tercerpiso-result" class="mt-1 text-xs font-medium text-[color:var(--orange)]" style="display:none;"></p>
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Cochera objetivo (m²)</label>
+            <input type="text" inputmode="decimal" id="est-cochera" value="${esc(state.estCochera)}" oninput="handleEstInput('estCochera', this.value)"
+              class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            <p id="est-cochera-result" class="mt-1 text-xs font-medium text-[color:var(--orange)]" style="display:none;"></p>
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-600">Pila / Terraza objetivo (m²)</label>
+            <input type="text" inputmode="decimal" id="est-pilas" value="${esc(state.estPilas)}" oninput="handleEstInput('estPilas', this.value)"
+              class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200" />
+            <p id="est-pilas-result" class="mt-1 text-xs font-medium text-[color:var(--orange)]" style="display:none;"></p>
+          </div>
+        </div>
+      </div>
+
+      ${state.estFamilia ? `
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <h2 class="mb-1 text-sm font-semibold uppercase tracking-wide text-slate-500">Presupuestos base sugeridos</h2>
+        <p class="mb-4 text-xs text-slate-400">${sugerencias.length} variante${sugerencias.length !== 1 ? "s" : ""} de "${esc(state.estFamilia)}", ordenadas por cercanía de área cerrada. Haz clic para seleccionar.</p>
+        <div class="overflow-x-auto">
+          <table class="w-full min-w-[820px] text-left text-sm">
+            <thead>
+              <tr class="border-b border-slate-200 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+                <th class="px-3 py-2 font-semibold">Modelo / Tipo</th>
+                <th class="px-3 py-2 text-right font-semibold">Cerrada</th>
+                <th class="px-3 py-2 text-right font-semibold">3er Piso</th>
+                <th class="px-3 py-2 text-right font-semibold">Cochera</th>
+                <th class="px-3 py-2 text-right font-semibold">Pila/Terr.</th>
+                <th class="px-3 py-2 text-right font-semibold">Costo Directo</th>
+                <th class="px-3 py-2"></th>
+              </tr>
+            </thead>
+            <tbody class="mono">
+              ${sugerencias.map((b, i) => {
+                const isSel = state.estSelectedBaseId === b.id;
+                return `
+                <tr class="border-b border-slate-100 last:border-0 ${isSel ? "font-semibold" : "hover:bg-slate-50"}" ${isSel ? 'style="background:rgba(173,208,16,0.18)"' : ""}>
+                  <td class="px-3 py-2" style="font-family:'Roboto',sans-serif;">${esc(b.modelo)} <span class="text-slate-400">· ${esc(b.tipo)}</span> ${i === 0 && !isSel ? '<span class="ml-1 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600">+ cercana</span>' : ""}</td>
+                  <td class="px-3 py-2 text-right">${fmtNum(b.const_cerrada)}</td>
+                  <td class="px-3 py-2 text-right">${fmtNum(b.tercer_piso)}</td>
+                  <td class="px-3 py-2 text-right">${fmtNum(b.cochera)}</td>
+                  <td class="px-3 py-2 text-right">${fmtNum(b.pila_terraza)}</td>
+                  <td class="px-3 py-2 text-right">₡${fmtMoney(b.costo_directo)}</td>
+                  <td class="px-3 py-2 text-right"><button onclick="handleSelectBase('${b.id}')" class="rounded-md px-2.5 py-1 text-xs font-semibold" style="background:var(--orange);color:var(--orange-ink)">${isSel ? "Elegida" : "Elegir"}</button></td>
+                </tr>`;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ""}
+    </div>
+
+    <!-- Columna derecha: resultado de la estimación -->
+    <div class="lg:col-span-1">
+      <div class="sticky top-6 p-6" style="background:var(--chip);border:1.5px solid var(--stroke);border-radius:15px">
+        <h3 class="mb-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Estimación</h3>
+        <div id="est-detalle">${selected ? renderEstimacionDetalle(selected) : `<p class="text-sm text-slate-500">Selecciona un presupuesto base de la lista para ver la estimación.</p>`}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderEstimacionDetalle(base) {
+  const e = calcEstimacion(base);
+  const signo = (v) => v > 0 ? "+" : "";
+  return `
+    <dl class="mono space-y-3">
+      <div class="border-b border-slate-300 pb-3">
+        <dt class="text-xs text-slate-500">Base seleccionada</dt>
+        <dd class="text-sm font-semibold" style="font-family:'Roboto',sans-serif;">${esc(base.modelo)} · ${esc(base.tipo)}</dd>
+      </div>
+      <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+        <dt class="text-xs text-slate-500">Costo Directo base</dt>
+        <dd class="text-sm font-semibold">₡${fmtMoney(base.costo_directo)}</dd>
+      </div>
+      <div class="flex items-center justify-between">
+        <dt class="text-xs text-slate-500">Dif. área cerrada</dt>
+        <dd class="text-sm ${e.difCerrada < 0 ? "text-red-600" : "text-emerald-700"}">${signo(e.difCerrada)}${fmtNum(e.difCerrada)} m²</dd>
+      </div>
+      <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+        <dt class="text-xs text-slate-500">Ajuste (×₡${fmtMoney(AJUSTE_CERRADA)})</dt>
+        <dd class="text-sm ${e.ajusteCerrada < 0 ? "text-red-600" : "text-emerald-700"}">${signo(e.ajusteCerrada)}₡${fmtMoney(e.ajusteCerrada)}</dd>
+      </div>
+      <div class="flex items-center justify-between">
+        <dt class="text-xs text-slate-500">Dif. cochera+pila/terraza</dt>
+        <dd class="text-sm ${e.difExterior < 0 ? "text-red-600" : "text-emerald-700"}">${signo(e.difExterior)}${fmtNum(e.difExterior)} m²</dd>
+      </div>
+      <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+        <dt class="text-xs text-slate-500">Ajuste (×₡${fmtMoney(AJUSTE_EXTERIOR)})</dt>
+        <dd class="text-sm ${e.ajusteExterior < 0 ? "text-red-600" : "text-emerald-700"}">${signo(e.ajusteExterior)}₡${fmtMoney(e.ajusteExterior)}</dd>
+      </div>
+      <div class="flex items-center justify-between border-b-2 border-slate-400 pb-3">
+        <dt class="text-xs font-bold text-slate-700">COSTO DIRECTO ESTIMADO</dt>
+        <dd class="text-lg font-bold" style="color:var(--orange)">₡${fmtMoney(e.costoDirectoEstimado)}</dd>
+      </div>
+      <div class="flex items-center justify-between">
+        <dt class="text-xs text-slate-500">Materiales (base)</dt>
+        <dd class="text-sm">₡${fmtMoney(base.costo_materiales)}</dd>
+      </div>
+      <div class="flex items-center justify-between">
+        <dt class="text-xs text-slate-500">Mano de obra (base)</dt>
+        <dd class="text-sm">₡${fmtMoney(base.costo_mano_obra)}</dd>
+      </div>
+      <div class="flex items-center justify-between border-b border-slate-300 pb-3">
+        <dt class="text-xs text-slate-500">Costo Indirecto (base)</dt>
+        <dd class="text-sm">₡${fmtMoney(base.costo_indirecto)}</dd>
+      </div>
+    </dl>
+    <button onclick="handleUsarEstimacion()" class="mt-5 w-full rounded-lg px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition" style="background:var(--orange)" onmouseover="this.style.background='#96b40e'" onmouseout="this.style.background='var(--orange)'">
+      Usar en Formulario de Entrada
+    </button>
+    <p class="mt-2 text-xs leading-relaxed text-slate-500">Precarga el Costo Directo estimado y el Costo Indirecto de la base en el formulario. Podrás ajustar todo antes de guardar.</p>`;
+}
+
+function handleEstFamilia(value) {
+  state.estFamilia = value;
+  state.estSelectedBaseId = null;
+  render();
+}
+
+function handleEstInput(field, value) {
+  state[field] = value;
+
+  // Preview de la operación bajo el campo (igual que en el formulario)
+  const idMap = { estCerrada: "est-cerrada", estTercerPiso: "est-tercerpiso", estCochera: "est-cochera", estPilas: "est-pilas" };
+  const resultEl = document.getElementById(`${idMap[field]}-result`);
+  if (resultEl) {
+    const evaluated = safeEvalMath(value);
+    const isExpression = /[+\-*/()]/.test(value || "") && !isNaN(evaluated);
+    resultEl.style.display = isExpression ? "" : "none";
+    resultEl.textContent = isExpression ? "= " + fmtNum(evaluated) : "";
+  }
+
+  // Si hay una base seleccionada, refrescamos solo el detalle de estimación (sin re-render completo, para no perder el foco)
+  if (state.estSelectedBaseId) {
+    const base = state.baseList.find(b => b.id === state.estSelectedBaseId);
+    const cont = document.getElementById("est-detalle");
+    if (base && cont) cont.innerHTML = renderEstimacionDetalle(base);
+  }
+}
+
+function handleSelectBase(id) {
+  state.estSelectedBaseId = id;
+  render();
+}
+
+function handleUsarEstimacion() {
+  const base = state.baseList.find(b => b.id === state.estSelectedBaseId);
+  if (!base) return;
+  const e = calcEstimacion(base);
+  // Precargamos el formulario con lo que tenemos.
+  // El modelo se deja vacío a propósito: la familia base (ej. "ZANTE 5.50 M") solo sirvió
+  // para el match; en el formulario el modelo se escribe como se maneja en la app (ej. "Tebas Azotea").
+  state.form = { ...emptyForm };
+  state.form.tipoPresupuesto = "rapido";
+  state.form.cerrada = String((safeEvalMath(state.estCerrada) || 0) + (safeEvalMath(state.estTercerPiso) || 0) || "");
+  state.form.cochera = String(safeEvalMath(state.estCochera) || "");
+  state.form.pilas = String(safeEvalMath(state.estPilas) || "");
+  state.form.costoDirecto = String(Math.round(e.costoDirectoEstimado));
+  state.form.costoIndirecto = String(Math.round(base.costo_indirecto));
+  state.form.postventa = String(Math.round(e.costoDirectoEstimado * 0.02));
+  // Limpiamos los datos del estimador para dejarlo listo para una nueva estimación
+  state.estFamilia = "";
+  state.estCerrada = "";
+  state.estTercerPiso = "";
+  state.estCochera = "";
+  state.estPilas = "";
+  state.estSelectedBaseId = null;
+  state.activeTab = "formulario";
+  state.toast = "Estimación cargada en el formulario. Revisa y completa los demás campos antes de guardar.";
+  render();
+  setTimeout(() => { state.toast = null; render(); }, 5000);
+}
+
+/* ============================================================ */
+/*  AUTENTICACIÓN                                                */
+/* ============================================================ */
+function openLogin() { state.showLogin = true; state.loginError = ""; render(); }
+function closeLogin() { state.showLogin = false; render(); }
+
+function renderLoginModal() {
+  return `
+  <div class="fixed inset-0 z-50 flex items-center justify-center p-4" style="background:rgba(28,24,19,0.5)">
+    <div class="w-full max-w-sm p-6" style="background:var(--surface);border:2px solid var(--stroke);border-radius:18px">
+      <h3 class="display mb-4 text-2xl">Iniciar sesión</h3>
+      <div class="space-y-3">
+        <input type="email" id="login-email" placeholder="Correo" class="w-full px-3 py-2 text-sm outline-none" style="border:1.5px solid var(--line);border-radius:10px;background:var(--bg)" />
+        <input type="password" id="login-password" placeholder="Contraseña" class="w-full px-3 py-2 text-sm outline-none" style="border:1.5px solid var(--line);border-radius:10px;background:var(--bg)" />
+        ${state.loginError ? `<p class="text-xs" style="color:var(--orange)">${esc(state.loginError)}</p>` : ""}
+        <div class="flex gap-2 pt-2">
+          <button onclick="handleLogin()" ${state.loginBusy ? "disabled" : ""} class="flex-1 px-4 py-2 text-sm font-semibold disabled:opacity-60" style="background:var(--orange);color:var(--orange-ink);border-radius:999px">${state.loginBusy ? "Ingresando..." : "Ingresar"}</button>
+          <button onclick="closeLogin()" class="flex-1 px-4 py-2 text-sm font-semibold" style="border:1.5px solid var(--stroke);border-radius:999px;color:var(--ink)">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function handleLogin() {
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+  state.loginBusy = true; render();
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  state.loginBusy = false;
+  if (error) { state.loginError = "Correo o contraseña incorrectos."; render(); return; }
+  state.showLogin = false;
+  state.entered = true;
+  state.activeTab = "estimador";
+  render();
+}
+
+async function handleLogout() {
+  await sb.auth.signOut();
+  state.activeTab = "historial";
+  render();
+}
+
+// ---- Borrado con doble confirmación ----
+function pedirBorrado(casa) {
+  state.deleteTarget = casa;
+  state.deleteStep = 1;
+  render();
+}
+function avanzarBorrado() {
+  state.deleteStep = 2;
+  render();
+}
+function cancelarBorrado() {
+  state.deleteTarget = null;
+  state.deleteStep = 0;
+  state.deleting = false;
+  render();
+}
+async function confirmarBorrado() {
+  if (!state.deleteTarget) return;
+  state.deleting = true; render();
+  const { error } = await sb.from("presupuestos").delete().eq("casa", state.deleteTarget);
+  state.deleting = false;
+  if (error) {
+    state.toast = "Error al borrar: " + error.message;
+    state.deleteTarget = null; state.deleteStep = 0;
+    render();
+    setTimeout(() => { state.toast = null; render(); }, 4000);
+    return;
+  }
+  const borrada = state.deleteTarget;
+  state.deleteTarget = null; state.deleteStep = 0;
+  state.toast = `Presupuesto "${borrada}" borrado correctamente.`;
+  await loadHouses();
+  setTimeout(() => { state.toast = null; render(); }, 3500);
+}
+
+function renderDeleteModal() {
+  if (state.deleteStep === 0 || !state.deleteTarget) return "";
+  const casa = esc(state.deleteTarget);
+  if (state.deleteStep === 1) {
+    return `
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-4" style="background:rgba(28,24,19,0.5)">
+      <div class="w-full max-w-sm p-6" style="background:var(--surface);border:2px solid var(--stroke);border-radius:18px">
+        <h3 class="mb-2 text-lg font-semibold text-slate-800">¿Borrar presupuesto?</h3>
+        <p class="mb-5 text-sm text-slate-500">Estás por borrar la casa <span class="font-semibold text-slate-700">${casa}</span>. Esta acción no se puede deshacer.</p>
+        <div class="flex gap-2">
+          <button onclick="avanzarBorrado()" class="flex-1 rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700">Continuar</button>
+          <button onclick="cancelarBorrado()" class="flex-1 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+  }
+  return `
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-4" style="background:rgba(28,24,19,0.5)">
+      <div class="w-full max-w-sm p-6" style="background:var(--surface);border:2px solid var(--stroke);border-radius:18px">
+        <h3 class="mb-2 text-lg font-semibold text-red-600">Confirmación final</h3>
+        <p class="mb-5 text-sm text-slate-500">¿Seguro que quieres borrar <span class="font-semibold text-slate-700">${casa}</span> de forma permanente? Este es el último paso.</p>
+        <div class="flex gap-2">
+          <button onclick="confirmarBorrado()" ${state.deleting ? "disabled" : ""} class="flex-1 rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-60">${state.deleting ? "Borrando..." : "Sí, borrar definitivamente"}</button>
+          <button onclick="cancelarBorrado()" class="flex-1 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+</script>
+</body>
+</html>
